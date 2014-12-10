@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/i2c.h>
+#include <linux/i2c/aps_ts.h>
 
 #include "greybus.h"
 #include "gpbridge.h"
@@ -297,10 +298,28 @@ static int gb_i2c_device_setup(struct gb_i2c_device *gb_i2c_dev)
 	return gb_i2c_timeout_operation(gb_i2c_dev, GB_I2C_TIMEOUT_DEFAULT);
 }
 
+static struct aps_ts_platform_data spiral2_ts_pdata = {
+    .gpio_irq = 253,
+		.max_x = 720,
+		.max_y = 1280,
+		.max_col = 12,
+		.max_row = 20,
+		.max_finger_num = 10,
+		.max_width = 30,
+		.max_pressure = 255,
+};
+
+static struct i2c_board_info board_info = {
+	.type		= "aps_ts",
+	.addr		= 0x34,
+	.platform_data	= &spiral2_ts_pdata,
+};
+
 static int gb_i2c_connection_init(struct gb_connection *connection)
 {
 	struct gb_i2c_device *gb_i2c_dev;
 	struct i2c_adapter *adapter;
+	struct i2c_client *client;
 	int ret;
 
 	gb_i2c_dev = kzalloc(sizeof(*gb_i2c_dev), GFP_KERNEL);
@@ -331,7 +350,17 @@ static int gb_i2c_connection_init(struct gb_connection *connection)
 	if (ret)
 		goto out_err;
 
+	client = i2c_new_device(adapter, &board_info);
+	if (!client) {
+		pr_err("Couldn't instantiate i2c client device (%d)\n", ret);
+		ret = -ENODEV;
+		goto rm_adapter;
+	}
+
 	return 0;
+
+rm_adapter:
+	i2c_del_adapter(adapter);
 out_err:
 	/* kref_put(gb_i2c_dev->connection) */
 	kfree(gb_i2c_dev);

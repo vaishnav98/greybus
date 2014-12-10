@@ -52,6 +52,7 @@ static int gb_gpio_line_count_operation(struct gb_gpio_controller *ggc)
 	struct gb_gpio_line_count_response response;
 	int ret;
 
+	pr_err("payload_size = %d\n", sizeof(response));
 	ret = gb_operation_sync(ggc->connection, GB_GPIO_TYPE_LINE_COUNT,
 				NULL, 0, &response, sizeof(response));
 	if (!ret)
