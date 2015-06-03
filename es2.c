@@ -64,16 +64,9 @@ struct es1_cport_in {
 
 /*
  * @endpoint: bulk out endpoint for CPort data
- * @urb: array of urbs for the CPort out messages
- * @urb_busy: array of flags to see if the @cport_out_urb is busy or
- *			not.
- * @urb_lock: locks the @cport_out_urb_busy "list"
  */
 struct es1_cport_out {
 	__u8 endpoint;
-	struct urb *urb[NUM_CPORT_OUT_URB];
-	bool urb_busy[NUM_CPORT_OUT_URB];
-	spinlock_t urb_lock;
 };
 
 /**
@@ -87,7 +80,11 @@ struct es1_cport_out {
  * @svc_buffer: buffer for SVC messages coming in on @svc_endpoint
  * @svc_urb: urb for SVC messages coming in on @svc_endpoint
  * @cport_in: endpoint, urbs and buffer for cport in messages
- * @cport_out: endpoint and urbs for for cport out messages
+ * @cport_out: endpoint for for cport out messages
+ * @cport_out_urb: array of urbs for the CPort out messages
+ * @cport_out_urb_busy: array of flags to see if the @cport_out_urb is busy or
+ *			not.
+ * @cport_out_urb_lock: locks the @cport_out_urb_busy "list"
  */
 struct es1_ap_dev {
 	struct usb_device *usb_dev;
@@ -102,6 +99,10 @@ struct es1_ap_dev {
 
 	struct es1_cport_in cport_in;
 	struct es1_cport_out cport_out;
+	struct urb *cport_out_urb[NUM_CPORT_IN_URB];
+	u8 *cport_out_buffer[NUM_CPORT_IN_URB];
+	bool cport_out_urb_busy[NUM_CPORT_OUT_URB];
+	spinlock_t cport_out_urb_lock;
 };
 
 static inline struct es1_ap_dev *hd_to_es1(struct greybus_host_device *hd)
@@ -141,17 +142,17 @@ static struct urb *next_free_urb(struct es1_ap_dev *es1, gfp_t gfp_mask)
 	unsigned long flags;
 	int i;
 
-	spin_lock_irqsave(&es1->cport_out.urb_lock, flags);
+	spin_lock_irqsave(&es1->cport_out_urb_lock, flags);
 
 	/* Look in our pool of allocated urbs first, as that's the "fastest" */
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
-		if (es1->cport_out.urb_busy[i] == false) {
-			es1->cport_out.urb_busy[i] = true;
-			urb = es1->cport_out.urb[i];
+		if (es1->cport_out_urb_busy[i] == false) {
+			es1->cport_out_urb_busy[i] = true;
+			urb = es1->cport_out_urb[i];
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&es1->cport_out.urb_lock, flags);
+	spin_unlock_irqrestore(&es1->cport_out_urb_lock, flags);
 	if (urb)
 		return urb;
 
@@ -172,15 +173,15 @@ static void free_urb(struct es1_ap_dev *es1, struct urb *urb)
 	 * See if this was an urb in our pool, if so mark it "free", otherwise
 	 * we need to free it ourselves.
 	 */
-	spin_lock_irqsave(&es1->cport_out.urb_lock, flags);
+	spin_lock_irqsave(&es1->cport_out_urb_lock, flags);
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
-		if (urb == es1->cport_out.urb[i]) {
-			es1->cport_out.urb_busy[i] = false;
+		if (urb == es1->cport_out_urb[i]) {
+			es1->cport_out_urb_busy[i] = false;
 			urb = NULL;
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&es1->cport_out.urb_lock, flags);
+	spin_unlock_irqrestore(&es1->cport_out_urb_lock, flags);
 
 	/* If urb is not NULL, then we need to free this urb */
 	usb_free_urb(urb);
@@ -305,14 +306,14 @@ static void ap_disconnect(struct usb_interface *interface)
 
 	/* Tear down everything! */
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
-		struct urb *urb = es1->cport_out.urb[i];
+		struct urb *urb = es1->cport_out_urb[i];
 
 		if (!urb)
 			break;
 		usb_kill_urb(urb);
 		usb_free_urb(urb);
-		es1->cport_out.urb[i] = NULL;
-		es1->cport_out.urb_busy[i] = false;	/* just to be anal */
+		es1->cport_out_urb[i] = NULL;
+		es1->cport_out_urb_busy[i] = false;	/* just to be anal */
 	}
 
 	for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
@@ -582,7 +583,7 @@ static int ap_probe(struct usb_interface *interface,
 	es1->hd = hd;
 	es1->usb_intf = interface;
 	es1->usb_dev = udev;
-	spin_lock_init(&es1->cport_out.urb_lock);
+	spin_lock_init(&es1->cport_out_urb_lock);
 	usb_set_intfdata(interface, es1);
 
 	/* Control endpoint is the pipe to talk to this AP, so save it off */
@@ -662,8 +663,8 @@ static int ap_probe(struct usb_interface *interface,
 		if (!urb)
 			goto error;
 
-		es1->cport_out.urb[i] = urb;
-		es1->cport_out.urb_busy[i] = false;	/* just to be anal */
+		es1->cport_out_urb[i] = urb;
+		es1->cport_out_urb_busy[i] = false;	/* just to be anal */
 	}
 
 	/* Start up our svc urb, which allows events to start flowing */
