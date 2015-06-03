@@ -39,6 +39,9 @@ static struct dentry *apb1_log_enable_dentry;
 static struct task_struct *apb1_log_task;
 static DEFINE_KFIFO(apb1_log_fifo, char, APB1_LOG_SIZE);
 
+/* Number of bulk in and bulk out couple */
+#define NUM_BULKS		7
+
 /*
  * Number of CPort IN urbs in flight at any point in time.
  * Adjust if we are having stalls in the USB buffer due to not enough urbs in
@@ -49,7 +52,7 @@ static DEFINE_KFIFO(apb1_log_fifo, char, APB1_LOG_SIZE);
 /* Number of CPort OUT urbs in flight at any point in time.
  * Adjust if we get messages saying we are out of urbs in the system log.
  */
-#define NUM_CPORT_OUT_URB	8
+#define NUM_CPORT_OUT_URB	8 * NUM_BULKS
 
 /*
  * @endpoint: bulk in endpoint for CPort data
@@ -97,8 +100,8 @@ struct es1_ap_dev {
 	u8 *svc_buffer;
 	struct urb *svc_urb;
 
-	struct es1_cport_in cport_in;
-	struct es1_cport_out cport_out;
+	struct es1_cport_in cport_in[NUM_BULKS];
+	struct es1_cport_out cport_out[NUM_BULKS];
 	struct urb *cport_out_urb[NUM_CPORT_IN_URB];
 	u8 *cport_out_buffer[NUM_CPORT_IN_URB];
 	bool cport_out_urb_busy[NUM_CPORT_OUT_URB];
@@ -201,6 +204,7 @@ static void *message_send(struct greybus_host_device *hd, u16 cport_id,
 	size_t buffer_size;
 	int retval;
 	struct urb *urb;
+	int bulk_out = 0;
 
 	buffer = message->buffer;
 	buffer_size = sizeof(*message->header) + message->payload_size;
@@ -227,7 +231,8 @@ static void *message_send(struct greybus_host_device *hd, u16 cport_id,
 	put_unaligned_le16(cport_id, message->header->pad);
 
 	usb_fill_bulk_urb(urb, udev,
-			  usb_sndbulkpipe(udev, es1->cport_out.endpoint),
+			  usb_sndbulkpipe(udev,
+					  es1->cport_out[bulk_out].endpoint),
 			  buffer, buffer_size,
 			  cport_out_callback, message);
 	retval = usb_submit_urb(urb, gfp_mask);
@@ -296,6 +301,7 @@ static void ap_disconnect(struct usb_interface *interface)
 {
 	struct es1_ap_dev *es1;
 	struct usb_device *udev;
+	int bulk_in;
 	int i;
 
 	es1 = usb_get_intfdata(interface);
@@ -316,15 +322,18 @@ static void ap_disconnect(struct usb_interface *interface)
 		es1->cport_out_urb_busy[i] = false;	/* just to be anal */
 	}
 
-	for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
-		struct urb *urb = es1->cport_in.urb[i];
+	for (bulk_in = 0; bulk_in < NUM_BULKS; bulk_in++) {
+		struct es1_cport_in *cport_in = &es1->cport_in[bulk_in];
+		for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
+			struct urb *urb = cport_in->urb[i];
 
-		if (!urb)
-			break;
-		usb_kill_urb(urb);
-		usb_free_urb(urb);
-		kfree(es1->cport_in.buffer[i]);
-		es1->cport_in.buffer[i] = NULL;
+			if (!urb)
+				break;
+			usb_kill_urb(urb);
+			usb_free_urb(urb);
+			kfree(cport_in->buffer[i]);
+			cport_in->buffer[i] = NULL;
+		}
 	}
 
 	usb_kill_urb(es1->svc_urb);
@@ -563,8 +572,8 @@ static int ap_probe(struct usb_interface *interface,
 	struct usb_host_interface *iface_desc;
 	struct usb_endpoint_descriptor *endpoint;
 	bool int_in_found = false;
-	bool bulk_in_found = false;
-	bool bulk_out_found = false;
+	int bulk_in = 0;
+	int bulk_out = 0;
 	int retval = -ENOMEM;
 	int i;
 	u16 endo_id = 0x4755;	// FIXME - get endo "ID" from the SVC
@@ -600,11 +609,11 @@ static int ap_probe(struct usb_interface *interface,
 			svc_interval = endpoint->bInterval;
 			int_in_found = true;
 		} else if (usb_endpoint_is_bulk_in(endpoint)) {
-			es1->cport_in.endpoint = endpoint->bEndpointAddress;
-			bulk_in_found = true;
+			es1->cport_in[bulk_in].endpoint = endpoint->bEndpointAddress;
+			bulk_in++;
 		} else if (usb_endpoint_is_bulk_out(endpoint)) {
-			es1->cport_out.endpoint = endpoint->bEndpointAddress;
-			bulk_out_found = true;
+			es1->cport_out[bulk_out].endpoint = endpoint->bEndpointAddress;
+			bulk_out++;
 		} else {
 			dev_err(&udev->dev,
 				"Unknown endpoint type found, address %x\n",
@@ -612,8 +621,8 @@ static int ap_probe(struct usb_interface *interface,
 		}
 	}
 	if ((int_in_found == false) ||
-	    (bulk_in_found == false) ||
-	    (bulk_out_found == false)) {
+	    (bulk_in == 0) ||
+	    (bulk_out == 0)) {
 		dev_err(&udev->dev, "Not enough endpoints found in device, aborting!\n");
 		goto error;
 	}
@@ -635,6 +644,7 @@ static int ap_probe(struct usb_interface *interface,
 	/* Allocate buffers for our cport in messages and start them up */
 	for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
 		struct urb *urb;
+		int bulk_in;
 		u8 *buffer;
 
 		urb = usb_alloc_urb(0, GFP_KERNEL);
@@ -644,15 +654,19 @@ static int ap_probe(struct usb_interface *interface,
 		if (!buffer)
 			goto error;
 
-		usb_fill_bulk_urb(urb, udev,
-				  usb_rcvbulkpipe(udev, es1->cport_in.endpoint),
-				  buffer, ES1_GBUF_MSG_SIZE_MAX,
-				  cport_in_callback, hd);
-		es1->cport_in.urb[i] = urb;
-		es1->cport_in.buffer[i] = buffer;
-		retval = usb_submit_urb(urb, GFP_KERNEL);
-		if (retval)
-			goto error;
+		for (bulk_in = 0; bulk_in < NUM_BULKS; bulk_in++) {
+			struct es1_cport_in *cport_in = &es1->cport_in[bulk_in];
+			usb_fill_bulk_urb(urb, udev,
+					  usb_rcvbulkpipe(udev, cport_in->endpoint),
+					  buffer, ES1_GBUF_MSG_SIZE_MAX,
+					  cport_in_callback, hd);
+			cport_in->urb[i] = urb;
+			cport_in->buffer[i] = buffer;
+			retval = usb_submit_urb(urb, GFP_KERNEL);
+			/* TODO errors handling is not adapted */
+			if (retval)
+				goto error;
+		}
 	}
 
 	/* Allocate urbs for our CPort OUT messages */
