@@ -51,6 +51,31 @@ static DEFINE_KFIFO(apb1_log_fifo, char, APB1_LOG_SIZE);
  */
 #define NUM_CPORT_OUT_URB	8
 
+/*
+ * @endpoint: bulk in endpoint for CPort data
+ * @urb: array of urbs for the CPort in messages
+ * @buffer: array of buffers for the @cport_in_urb urbs
+ */
+struct es1_cport_in {
+	__u8 endpoint;
+	struct urb *urb[NUM_CPORT_IN_URB];
+	u8 *buffer[NUM_CPORT_IN_URB];
+};
+
+/*
+ * @endpoint: bulk out endpoint for CPort data
+ * @urb: array of urbs for the CPort out messages
+ * @urb_busy: array of flags to see if the @cport_out_urb is busy or
+ *			not.
+ * @urb_lock: locks the @cport_out_urb_busy "list"
+ */
+struct es1_cport_out {
+	__u8 endpoint;
+	struct urb *urb[NUM_CPORT_OUT_URB];
+	bool urb_busy[NUM_CPORT_OUT_URB];
+	spinlock_t urb_lock;
+};
+
 /**
  * es1_ap_dev - ES1 USB Bridge to AP structure
  * @usb_dev: pointer to the USB device we are.
@@ -58,16 +83,11 @@ static DEFINE_KFIFO(apb1_log_fifo, char, APB1_LOG_SIZE);
  * @hd: pointer to our greybus_host_device structure
  * @control_endpoint: endpoint to send data to SVC
  * @svc_endpoint: endpoint for SVC data in
- * @cport_in_endpoint: bulk in endpoint for CPort data
- * @cport-out_endpoint: bulk out endpoint for CPort data
+
  * @svc_buffer: buffer for SVC messages coming in on @svc_endpoint
  * @svc_urb: urb for SVC messages coming in on @svc_endpoint
- * @cport_in_urb: array of urbs for the CPort in messages
- * @cport_in_buffer: array of buffers for the @cport_in_urb urbs
- * @cport_out_urb: array of urbs for the CPort out messages
- * @cport_out_urb_busy: array of flags to see if the @cport_out_urb is busy or
- *			not.
- * @cport_out_urb_lock: locks the @cport_out_urb_busy "list"
+ * @cport_in: endpoint, urbs and buffer for cport in messages
+ * @cport_out: endpoint and urbs for for cport out messages
  */
 struct es1_ap_dev {
 	struct usb_device *usb_dev;
@@ -76,17 +96,12 @@ struct es1_ap_dev {
 
 	__u8 control_endpoint;
 	__u8 svc_endpoint;
-	__u8 cport_in_endpoint;
-	__u8 cport_out_endpoint;
 
 	u8 *svc_buffer;
 	struct urb *svc_urb;
 
-	struct urb *cport_in_urb[NUM_CPORT_IN_URB];
-	u8 *cport_in_buffer[NUM_CPORT_IN_URB];
-	struct urb *cport_out_urb[NUM_CPORT_OUT_URB];
-	bool cport_out_urb_busy[NUM_CPORT_OUT_URB];
-	spinlock_t cport_out_urb_lock;
+	struct es1_cport_in cport_in;
+	struct es1_cport_out cport_out;
 };
 
 static inline struct es1_ap_dev *hd_to_es1(struct greybus_host_device *hd)
@@ -126,17 +141,17 @@ static struct urb *next_free_urb(struct es1_ap_dev *es1, gfp_t gfp_mask)
 	unsigned long flags;
 	int i;
 
-	spin_lock_irqsave(&es1->cport_out_urb_lock, flags);
+	spin_lock_irqsave(&es1->cport_out.urb_lock, flags);
 
 	/* Look in our pool of allocated urbs first, as that's the "fastest" */
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
-		if (es1->cport_out_urb_busy[i] == false) {
-			es1->cport_out_urb_busy[i] = true;
-			urb = es1->cport_out_urb[i];
+		if (es1->cport_out.urb_busy[i] == false) {
+			es1->cport_out.urb_busy[i] = true;
+			urb = es1->cport_out.urb[i];
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&es1->cport_out_urb_lock, flags);
+	spin_unlock_irqrestore(&es1->cport_out.urb_lock, flags);
 	if (urb)
 		return urb;
 
@@ -157,15 +172,15 @@ static void free_urb(struct es1_ap_dev *es1, struct urb *urb)
 	 * See if this was an urb in our pool, if so mark it "free", otherwise
 	 * we need to free it ourselves.
 	 */
-	spin_lock_irqsave(&es1->cport_out_urb_lock, flags);
+	spin_lock_irqsave(&es1->cport_out.urb_lock, flags);
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
-		if (urb == es1->cport_out_urb[i]) {
-			es1->cport_out_urb_busy[i] = false;
+		if (urb == es1->cport_out.urb[i]) {
+			es1->cport_out.urb_busy[i] = false;
 			urb = NULL;
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&es1->cport_out_urb_lock, flags);
+	spin_unlock_irqrestore(&es1->cport_out.urb_lock, flags);
 
 	/* If urb is not NULL, then we need to free this urb */
 	usb_free_urb(urb);
@@ -211,7 +226,7 @@ static void *message_send(struct greybus_host_device *hd, u16 cport_id,
 	put_unaligned_le16(cport_id, message->header->pad);
 
 	usb_fill_bulk_urb(urb, udev,
-			  usb_sndbulkpipe(udev, es1->cport_out_endpoint),
+			  usb_sndbulkpipe(udev, es1->cport_out.endpoint),
 			  buffer, buffer_size,
 			  cport_out_callback, message);
 	retval = usb_submit_urb(urb, gfp_mask);
@@ -290,25 +305,25 @@ static void ap_disconnect(struct usb_interface *interface)
 
 	/* Tear down everything! */
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
-		struct urb *urb = es1->cport_out_urb[i];
+		struct urb *urb = es1->cport_out.urb[i];
 
 		if (!urb)
 			break;
 		usb_kill_urb(urb);
 		usb_free_urb(urb);
-		es1->cport_out_urb[i] = NULL;
-		es1->cport_out_urb_busy[i] = false;	/* just to be anal */
+		es1->cport_out.urb[i] = NULL;
+		es1->cport_out.urb_busy[i] = false;	/* just to be anal */
 	}
 
 	for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
-		struct urb *urb = es1->cport_in_urb[i];
+		struct urb *urb = es1->cport_in.urb[i];
 
 		if (!urb)
 			break;
 		usb_kill_urb(urb);
 		usb_free_urb(urb);
-		kfree(es1->cport_in_buffer[i]);
-		es1->cport_in_buffer[i] = NULL;
+		kfree(es1->cport_in.buffer[i]);
+		es1->cport_in.buffer[i] = NULL;
 	}
 
 	usb_kill_urb(es1->svc_urb);
@@ -567,7 +582,7 @@ static int ap_probe(struct usb_interface *interface,
 	es1->hd = hd;
 	es1->usb_intf = interface;
 	es1->usb_dev = udev;
-	spin_lock_init(&es1->cport_out_urb_lock);
+	spin_lock_init(&es1->cport_out.urb_lock);
 	usb_set_intfdata(interface, es1);
 
 	/* Control endpoint is the pipe to talk to this AP, so save it off */
@@ -584,10 +599,10 @@ static int ap_probe(struct usb_interface *interface,
 			svc_interval = endpoint->bInterval;
 			int_in_found = true;
 		} else if (usb_endpoint_is_bulk_in(endpoint)) {
-			es1->cport_in_endpoint = endpoint->bEndpointAddress;
+			es1->cport_in.endpoint = endpoint->bEndpointAddress;
 			bulk_in_found = true;
 		} else if (usb_endpoint_is_bulk_out(endpoint)) {
-			es1->cport_out_endpoint = endpoint->bEndpointAddress;
+			es1->cport_out.endpoint = endpoint->bEndpointAddress;
 			bulk_out_found = true;
 		} else {
 			dev_err(&udev->dev,
@@ -629,11 +644,11 @@ static int ap_probe(struct usb_interface *interface,
 			goto error;
 
 		usb_fill_bulk_urb(urb, udev,
-				  usb_rcvbulkpipe(udev, es1->cport_in_endpoint),
+				  usb_rcvbulkpipe(udev, es1->cport_in.endpoint),
 				  buffer, ES1_GBUF_MSG_SIZE_MAX,
 				  cport_in_callback, hd);
-		es1->cport_in_urb[i] = urb;
-		es1->cport_in_buffer[i] = buffer;
+		es1->cport_in.urb[i] = urb;
+		es1->cport_in.buffer[i] = buffer;
 		retval = usb_submit_urb(urb, GFP_KERNEL);
 		if (retval)
 			goto error;
@@ -647,8 +662,8 @@ static int ap_probe(struct usb_interface *interface,
 		if (!urb)
 			goto error;
 
-		es1->cport_out_urb[i] = urb;
-		es1->cport_out_urb_busy[i] = false;	/* just to be anal */
+		es1->cport_out.urb[i] = urb;
+		es1->cport_out.urb_busy[i] = false;	/* just to be anal */
 	}
 
 	/* Start up our svc urb, which allows events to start flowing */
