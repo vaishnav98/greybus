@@ -36,6 +36,9 @@ static DEFINE_KFIFO(apb1_log_fifo, char, APB1_LOG_SIZE);
 /* Number of bulk in and bulk out couple */
 #define NUM_BULKS		7
 
+/* Bulk in and out endpoints for muxed cports */
+#define MUXED_BULK_EP	0
+
 /*
  * Number of CPort IN urbs in flight at any point in time.
  * Adjust if we are having stalls in the USB buffer due to not enough urbs in
@@ -78,6 +81,19 @@ struct es1_cport_out {
 	__u8 endpoint;
 };
 
+struct cport_to_ep {
+	__le16 cport_id;
+	__u8 endpoint_in;
+	__u8 endpoint_out;
+};
+
+struct direct_mapped_ep {
+	struct es1_ap_dev *es1;
+	spinlock_t ep_set_map_lock;
+	DECLARE_BITMAP(ep_set_map, NUM_BULKS);
+	struct cport_to_ep cport_to_ep[0];
+};
+
 /**
  * es1_ap_dev - ES1 USB Bridge to AP structure
  * @usb_dev: pointer to the USB device we are.
@@ -105,13 +121,7 @@ struct es1_ap_dev {
 	bool cport_out_urb_cancelled[NUM_CPORT_OUT_URB];
 	spinlock_t cport_out_urb_lock;
 
-	int *cport_to_ep;
-};
-
-struct cport_to_ep {
-	__le16 cport_id;
-	__u8 endpoint_in;
-	__u8 endpoint_out;
+	struct direct_mapped_ep *mapped_ep;
 };
 
 static inline struct es1_ap_dev *hd_to_es1(struct greybus_host_device *hd)
@@ -123,24 +133,112 @@ static void cport_out_callback(struct urb *urb);
 static void usb_log_enable(struct es1_ap_dev *es1);
 static void usb_log_disable(struct es1_ap_dev *es1);
 
+static int alloc_mapped_ep(struct es1_ap_dev *es1, int bulk_ep_set)
+{
+	struct direct_mapped_ep *mapped_ep = es1->mapped_ep;
+
+	if (bulk_ep_set == MUXED_BULK_EP)
+		return MUXED_BULK_EP;
+
+	spin_lock_irq(&mapped_ep->ep_set_map_lock);
+	if (bulk_ep_set == NUM_BULKS) {
+		bulk_ep_set =
+			find_first_zero_bit(mapped_ep->ep_set_map, NUM_BULKS);
+	} else if (test_bit(bulk_ep_set, mapped_ep->ep_set_map)) {
+		bulk_ep_set = NUM_BULKS;
+	}
+	if (bulk_ep_set == NUM_BULKS) {
+		spin_unlock_irq(&mapped_ep->ep_set_map_lock);
+		return MUXED_BULK_EP;
+	}
+	set_bit(bulk_ep_set, mapped_ep->ep_set_map);
+	spin_unlock_irq(&mapped_ep->ep_set_map_lock);
+	return bulk_ep_set;
+}
+
+static void free_mapped_ep(struct es1_ap_dev *es1, int bulk_ep_set)
+{
+	struct direct_mapped_ep *mapped_ep = es1->mapped_ep;
+
+	if (bulk_ep_set == MUXED_BULK_EP)
+		return;
+
+	spin_lock_irq(&mapped_ep->ep_set_map_lock);
+	clear_bit(bulk_ep_set, mapped_ep->ep_set_map);
+	spin_unlock_irq(&mapped_ep->ep_set_map_lock);
+}
+
+static void mapped_ep_init(struct es1_ap_dev *es1,
+				u16 cport_id, int bulk_ep_set)
+{
+	struct cport_to_ep *cport_to_ep;
+
+	cport_to_ep = &es1->mapped_ep->cport_to_ep[cport_id];
+
+	bulk_ep_set++;
+	cport_to_ep->cport_id = cport_id;
+	cport_to_ep->endpoint_out = bulk_ep_set << 1;
+	cport_to_ep->endpoint_in = cport_to_ep->endpoint_out - 1;
+}
+
+static void muxed_ep_init(struct es1_ap_dev *es1, u16 cport_id)
+{
+	mapped_ep_init(es1, cport_id, MUXED_BULK_EP);
+}
+
+static struct cport_to_ep *get_mapped_ep(struct es1_ap_dev *es1,
+						u16 cport_id)
+{
+	return &es1->mapped_ep->cport_to_ep[cport_id];
+}
+
+static struct direct_mapped_ep *direct_mapped_ep_alloc(struct es1_ap_dev *es1,
+							u16 cport_count)
+{
+	struct direct_mapped_ep *mapped_ep;
+
+	mapped_ep = kzalloc(sizeof(struct direct_mapped_ep) +
+				sizeof(struct cport_to_ep) * cport_count,
+				GFP_KERNEL);
+	if (!mapped_ep)
+		return NULL;
+	mapped_ep->es1 = es1;
+	bitmap_zero(mapped_ep->ep_set_map, cport_count);
+	set_bit(MUXED_BULK_EP, mapped_ep->ep_set_map);
+	spin_lock_init(&mapped_ep->ep_set_map_lock);
+
+	return mapped_ep;
+}
+
+static void direct_mapped_ep_free(struct direct_mapped_ep *mapped_ep)
+{
+	kfree(mapped_ep);
+}
+
+
 static int cport_to_ep(struct es1_ap_dev *es1, u16 cport_id)
 {
+	__u8 ep;
+
 	if (cport_id >= es1->hd->num_cports)
 		return 0;
-	return es1->cport_to_ep[cport_id];
+
+	ep = es1->mapped_ep->cport_to_ep[cport_id].endpoint_out;
+	return --ep >> 1;
 }
 
 #define ES1_TIMEOUT	500	/* 500 ms for the SVC to do something */
 
 static int ep_in_use(struct es1_ap_dev *es1, int bulk_ep_set)
 {
-	int i;
+	int in_use;
+	struct direct_mapped_ep *mapped_ep = es1->mapped_ep;
 
-	for (i = 0; i < es1->hd->num_cports; i++) {
-		if (es1->cport_to_ep[i] == bulk_ep_set)
-			return 1;
-	}
-	return 0;
+	spin_lock_irq(&mapped_ep->ep_set_map_lock);
+	in_use = test_bit(bulk_ep_set, mapped_ep->ep_set_map);
+	spin_unlock_irq(&mapped_ep->ep_set_map_lock);
+
+	return in_use;
 }
 
 int map_cport_to_ep(struct es1_ap_dev *es1,
@@ -153,17 +251,9 @@ int map_cport_to_ep(struct es1_ap_dev *es1,
 		return -EINVAL;
 	if (cport_id >= es1->hd->num_cports)
 		return -EINVAL;
-	if (bulk_ep_set && ep_in_use(es1, bulk_ep_set))
-		return -EINVAL;
 
-	cport_to_ep = kmalloc(sizeof(*cport_to_ep), GFP_KERNEL);
-	if (!cport_to_ep)
-		return -ENOMEM;
-
-	es1->cport_to_ep[cport_id] = bulk_ep_set;
-	cport_to_ep->cport_id = cpu_to_le16(cport_id);
-	cport_to_ep->endpoint_in = es1->cport_in[bulk_ep_set].endpoint;
-	cport_to_ep->endpoint_out = es1->cport_out[bulk_ep_set].endpoint;
+	mapped_ep_init(es1, cport_id, bulk_ep_set);
+	cport_to_ep = get_mapped_ep(es1, cport_id);
 
 	retval = usb_control_msg(es1->usb_dev,
 				 usb_sndctrlpipe(es1->usb_dev, 0),
@@ -175,7 +265,6 @@ int map_cport_to_ep(struct es1_ap_dev *es1,
 				 ES1_TIMEOUT);
 	if (retval == sizeof(*cport_to_ep))
 		retval = 0;
-	kfree(cport_to_ep);
 
 	return retval;
 }
@@ -288,6 +377,13 @@ static int message_send(struct greybus_host_device *hd, u16 cport_id,
 		return -EINVAL;
 	}
 
+	bulk_ep_set = cport_to_ep(es1, cport_id);
+	if (bulk_ep_set < 0) {
+		pr_err("invalid destination endpoint ep%d\n",
+			get_mapped_ep(es1, cport_id)->endpoint_out);
+		return -EINVAL;
+	}
+
 	/* Find a free urb */
 	urb = next_free_urb(es1, gfp_mask);
 	if (!urb)
@@ -302,7 +398,6 @@ static int message_send(struct greybus_host_device *hd, u16 cport_id,
 
 	buffer_size = sizeof(*message->header) + message->payload_size;
 
-	bulk_ep_set = cport_to_ep(es1, cport_id);
 	usb_fill_bulk_urb(urb, udev,
 			  usb_sndbulkpipe(udev,
 					  es1->cport_out[bulk_ep_set].endpoint),
@@ -439,7 +534,7 @@ static void ap_disconnect(struct usb_interface *interface)
 	usb_set_intfdata(interface, NULL);
 	udev = es1->usb_dev;
 	greybus_remove_hd(es1->hd);
-	kfree(es1->cport_to_ep);
+	direct_mapped_ep_free(es1->mapped_ep);
 
 	usb_put_dev(udev);
 }
@@ -709,9 +804,8 @@ static int ap_probe(struct usb_interface *interface,
 	spin_lock_init(&es1->cport_out_urb_lock);
 	usb_set_intfdata(interface, es1);
 
-	es1->cport_to_ep = kcalloc(hd->num_cports, sizeof(*es1->cport_to_ep),
-				   GFP_KERNEL);
-	if (!es1->cport_to_ep) {
+	es1->mapped_ep = direct_mapped_ep_alloc(es1, hd->num_cports);
+	if (!es1->mapped_ep) {
 		retval = -ENOMEM;
 		goto error;
 	}
@@ -765,6 +859,13 @@ static int ap_probe(struct usb_interface *interface,
 				goto error;
 		}
 	}
+
+	/*
+	 * Init default ep to cport mapping. We don't need to use
+	 * map_cport_to_ep because APBA firmware already did it.
+	 */
+	for (i = 0; i < hd->num_cports; i++)
+		muxed_ep_init(es1, i);
 
 	/* Allocate urbs for our CPort OUT messages */
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
