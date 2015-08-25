@@ -31,6 +31,7 @@ MODULE_DEVICE_TABLE(usb, id_table);
 #define APB1_LOG_SIZE		SZ_16K
 static struct dentry *apb1_log_dentry;
 static struct dentry *apb1_log_enable_dentry;
+static LIST_HEAD(intf_dentry_head);
 static struct task_struct *apb1_log_task;
 static DEFINE_KFIFO(apb1_log_fifo, char, APB1_LOG_SIZE);
 
@@ -500,6 +501,75 @@ static void message_cancel(struct gb_message *message)
 	usb_free_urb(urb);
 }
 
+static ssize_t cport_map_read(struct file *f, char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	char tmp_buf[8];
+	struct es1_ap_dev *es1;
+	struct cport_to_ep *mapping;
+
+	mapping = (struct cport_to_ep *)f->f_inode->i_private;
+	es1 = container_of(mapping, struct direct_mapped_ep,
+				cport_to_ep[mapping->cport_id])->es1;
+
+	sprintf(tmp_buf, "%d\n", cport_to_ep_pair(es1, mapping->cport_id));
+	return simple_read_from_buffer(buf, count, ppos,
+					tmp_buf, strlen(tmp_buf) + 1);
+}
+
+static ssize_t cport_map_write(struct file *f, const char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	int retval;
+	int ep_pair;
+	int old_ep_pair;
+	struct cport_to_ep *mapping;
+	struct es1_ap_dev *es1;
+
+	retval = kstrtoint_from_user(buf, count, 10, &ep_pair);
+	if (retval)
+		return retval;
+
+	mapping = (struct cport_to_ep *)f->f_inode->i_private;
+	es1 = container_of(mapping, struct direct_mapped_ep,
+				cport_to_ep[mapping->cport_id])->es1;
+
+	/* Ensure endpoints pair is not already mapped to a cport */
+	if (ep_pair && ep_pair_in_use(es1, ep_pair))
+		return -EINVAL;
+
+	/* If the cport is already mapped, then unmap it */
+	old_ep_pair = cport_to_ep_pair(es1, mapping->cport_id);
+	if (old_ep_pair && ep_pair != old_ep_pair)
+		unmap_cport(es1, mapping->cport_id);
+
+	/* Map the cport to the endpoints pair requested by user */
+	retval = map_cport_to_ep(es1, mapping->cport_id, ep_pair);
+	if (retval)
+		return retval;
+
+	return count;
+}
+
+static const struct file_operations cport_map_fops = {
+	.read	= cport_map_read,
+	.write	= cport_map_write,
+};
+
+static void debugfs_connection_create(struct gb_connection *connection)
+{
+	struct greybus_host_device *hd = connection->hd;
+	struct es1_ap_dev *es1 = hd_to_es1(hd);
+	struct dentry *parent;
+	u8 intf_id;
+
+	intf_id = connection->bundle->intf->interface_id;
+	parent = gb_debugfs_cport_create(connection, intf_id);
+	debugfs_create_file("ep_set", (S_IWUSR | S_IRUGO), parent,
+			get_mapped_ep(es1, connection->hd_cport_id),
+			&cport_map_fops);
+}
+
 /*
  * Simple cport to endpoints mapping policy.
  * Map cport to dedicated endpoints in order of connection creation,
@@ -512,6 +582,8 @@ static void connection_create(struct gb_connection *connection)
 	struct es1_ap_dev *es1 = hd_to_es1(hd);
 	int ep_pair;
 	int retval;
+
+	debugfs_connection_create(connection);
 
 	/* Map cport to endpoints pair only for loopback protocol */
 	if (connection->protocol_id != GREYBUS_PROTOCOL_LOOPBACK)
@@ -534,6 +606,7 @@ static void connection_destroy(struct gb_connection *connection)
 	struct es1_ap_dev *es1 = hd_to_es1(hd);
 
 	unmap_cport(es1, connection->hd_cport_id);
+	gb_debugfs_cport_destroy(connection);
 }
 
 static struct greybus_host_driver es1_driver = {
