@@ -500,8 +500,46 @@ static void message_cancel(struct gb_message *message)
 	usb_free_urb(urb);
 }
 
+/*
+ * Simple cport to endpoints mapping policy.
+ * Map cport to dedicated endpoints in order of connection creation,
+ * if the cport is used for loopback protocol.
+ * Fallback to muxed endpoints when all dedicated endpoints are allocated.
+ */
+static void connection_create(struct gb_connection *connection)
+{
+	struct greybus_host_device *hd = connection->hd;
+	struct es1_ap_dev *es1 = hd_to_es1(hd);
+	int ep_pair;
+	int retval;
+
+	/* Map cport to endpoints pair only for loopback protocol */
+	if (connection->protocol_id != GREYBUS_PROTOCOL_LOOPBACK)
+		return;
+
+	/*
+	 * Try to get an unmapped endpoints pair.
+	 * Fallback to muxed endpoints pair in case of error.
+	 */
+	ep_pair = find_first_unmapped_ep_pair(es1);
+	retval = map_cport_to_ep(es1, connection->hd_cport_id, ep_pair);
+	if (retval)
+		dev_err(&es1->usb_dev->dev,
+			"Can not map cport to dedicated endpoints\n");
+}
+
+static void connection_destroy(struct gb_connection *connection)
+{
+	struct greybus_host_device *hd = connection->hd;
+	struct es1_ap_dev *es1 = hd_to_es1(hd);
+
+	unmap_cport(es1, connection->hd_cport_id);
+}
+
 static struct greybus_host_driver es1_driver = {
 	.hd_priv_size		= sizeof(struct es1_ap_dev),
+	.connection_create	= connection_create,
+	.connection_destroy	= connection_destroy,
 	.message_send		= message_send,
 	.message_cancel		= message_cancel,
 };
