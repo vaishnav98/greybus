@@ -287,6 +287,8 @@ gb_connection_create_range(struct greybus_host_device *hd,
 		gb_svc_connection_create(hd->svc,
 					 hd->endo->ap_intf_id, hd_cport_id,
 					 bundle->intf->interface_id, cport_id);
+		if (hd->driver->connection_create)
+			hd->driver->connection_create(connection);
 	}
 
 	gb_connection_bind_protocol(connection);
@@ -357,6 +359,9 @@ void gb_connection_destroy(struct gb_connection *connection)
 	list_del(&connection->bundle_links);
 	list_del(&connection->hd_links);
 	spin_unlock_irq(&gb_connections_lock);
+
+	if (connection->hd->driver->connection_destroy)
+		connection->hd->driver->connection_destroy(connection);
 
 	if (connection->protocol)
 		gb_protocol_put(connection->protocol);
