@@ -47,6 +47,8 @@ struct gb_connection {
 	atomic_t			op_cycle;
 
 	void				*private;
+
+	struct dentry			*dentry;
 };
 #define to_gb_connection(d) container_of(d, struct gb_connection, dev)
 

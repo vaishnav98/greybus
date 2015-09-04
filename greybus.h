@@ -157,6 +157,9 @@ int greybus_disabled(void);
 void gb_debugfs_init(void);
 void gb_debugfs_cleanup(void);
 struct dentry *gb_debugfs_get(void);
+struct dentry *gb_debugfs_cport_create(struct gb_connection *connection,
+					u8 intf_id);
+void gb_debugfs_cport_destroy(struct gb_connection *connection);
 
 extern struct bus_type greybus_bus_type;
 
