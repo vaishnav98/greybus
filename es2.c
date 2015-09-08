@@ -115,6 +115,7 @@ struct cport_to_ep {
  */
 struct direct_mapped_ep {
 	DECLARE_BITMAP(ep_pair_map, NUM_BULKS);
+	u16 ep_to_cport[NUM_BULKS];
 	struct cport_to_ep cport_to_ep[0];
 };
 
@@ -167,6 +168,9 @@ static inline struct es2_ap_dev *hd_to_es2(struct gb_host_device *hd)
 static void cport_out_callback(struct urb *urb);
 static void usb_log_enable(struct es2_ap_dev *es2);
 static void usb_log_disable(struct es2_ap_dev *es2);
+static void
+gb_message_cport_pack(struct gb_operation_msg_hdr *header, u16 cport_id);
+static u16 gb_message_cport_unpack(struct gb_operation_msg_hdr *header);
 
 static inline struct cport_to_ep *get_mapped_ep(struct es2_ap_dev *es2,
 						u16 cport_id)
@@ -229,6 +233,9 @@ static void mapped_ep_init(struct es2_ap_dev *es2,
 {
 	struct cport_to_ep *cport_to_ep;
 
+	if (ep_pair != MUXED_EP_PAIR)
+		es2->mapped_ep->ep_to_cport[ep_pair] = cport_id;
+
 	cport_to_ep = get_mapped_ep(es2, cport_id);
 	cport_to_ep->cport_id = cport_id;
 	cport_to_ep->endpoint_out = ep_pair_to_bulk_out(ep_pair);
@@ -270,6 +277,41 @@ static int cport_to_ep_pair(struct es2_ap_dev *es2, u16 cport_id)
 		return 0;
 	cport_to_ep = get_mapped_ep(es2, cport_id);
 	return bulk_out_to_ep_pair(cport_to_ep->endpoint_out);
+}
+
+static u16 ep_to_cport(struct es2_ap_dev *es2, int ep_bulk_set)
+{
+	return es2->mapped_ep->ep_to_cport[ep_bulk_set];
+}
+
+static u16 mapped_ep_get_cport(struct es2_ap_dev *es2, struct urb *urb)
+{
+	struct gb_operation_msg_hdr *header;
+	u16 cport_id;
+	__u8 ep;
+
+	ep = usb_pipeendpoint(urb->pipe);
+	if (ep == MUXED_EP_IN) {
+		/* Extract the CPort id,
+		 * which is packed in the message header */
+		header = urb->transfer_buffer;
+		cport_id = gb_message_cport_unpack(header);
+		return cport_id;
+	}
+	return ep_to_cport(es2, --ep >> 1);
+}
+
+static void mapped_ep_set_cport(struct es2_ap_dev *es2, struct urb *urb,
+				u16 cport_id)
+{
+	struct gb_operation_msg_hdr *header;
+	__u8 ep = usb_pipeendpoint(urb->pipe);
+
+	if (ep == MUXED_EP_OUT) {
+		/* Pack the cport id into the message header */
+		header = urb->transfer_buffer;
+		gb_message_cport_pack(header, cport_id);
+	}
 }
 
 #define ES2_TIMEOUT	500	/* 500 ms for the SVC to do something */
@@ -476,9 +518,6 @@ static int message_send(struct gb_host_device *hd, u16 cport_id,
 	message->hcpriv = urb;
 	spin_unlock_irqrestore(&es2->cport_out_urb_lock, flags);
 
-	/* Pack the cport id into the message header */
-	gb_message_cport_pack(message->header, cport_id);
-
 	buffer_size = sizeof(*message->header) + message->payload_size;
 
 	ep_pair = cport_to_ep_pair(es2, cport_id);
@@ -489,6 +528,7 @@ static int message_send(struct gb_host_device *hd, u16 cport_id,
 			  cport_out_callback, message);
 	urb->transfer_flags |= URB_ZERO_PACKET;
 	trace_gb_host_device_send(hd, cport_id, buffer_size);
+	mapped_ep_set_cport(es2, urb, cport_id);
 	retval = usb_submit_urb(urb, gfp_mask);
 	if (retval) {
 		dev_err(&udev->dev, "failed to submit out-urb: %d\n", retval);
@@ -739,6 +779,7 @@ static void ap_disconnect(struct usb_interface *interface)
 static void cport_in_callback(struct urb *urb)
 {
 	struct gb_host_device *hd = urb->context;
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
 	struct device *dev = &urb->dev->dev;
 	struct gb_operation_msg_hdr *header;
 	int status = check_urb_status(urb);
@@ -757,9 +798,7 @@ static void cport_in_callback(struct urb *urb)
 		goto exit;
 	}
 
-	/* Extract the CPort id, which is packed in the message header */
-	header = urb->transfer_buffer;
-	cport_id = gb_message_cport_unpack(header);
+	cport_id = mapped_ep_get_cport(es2, urb);
 
 	if (cport_id_valid(hd, cport_id)) {
 		trace_gb_host_device_recv(hd, cport_id, urb->actual_length);
