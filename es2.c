@@ -37,6 +37,11 @@ static DEFINE_KFIFO(apb1_log_fifo, char, APB1_LOG_SIZE);
 /* Number of bulk in and bulk out couple */
 #define NUM_BULKS		7
 
+/* Bulk in and out endpoints for muxed cports */
+#define MUXED_EP_PAIR		0
+#define MUXED_EP_IN		1
+#define MUXED_EP_OUT		2
+
 /*
  * Number of CPort IN urbs in flight at any point in time.
  * Adjust if we are having stalls in the USB buffer due to not enough urbs in
@@ -58,6 +63,17 @@ static DEFINE_KFIFO(apb1_log_fifo, char, APB1_LOG_SIZE);
 /* vendor request to get the number of cports available */
 #define REQUEST_CPORT_COUNT	0x04
 
+/* convert the bulk out endpoint number to an endpoint pair number */
+#define bulk_out_to_ep_pair(ep)		\
+	((ep - MUXED_EP_OUT) >> 1)
+
+/* convert endpoints pair number to bulk in / out endpoint number */
+#define ep_pair_to_bulk_in(ep_pair)	\
+	(((ep_pair) << 1) + MUXED_EP_IN)
+
+#define ep_pair_to_bulk_out(ep_pair)	\
+	(((ep_pair) << 1) + MUXED_EP_OUT)
+
 /*
  * @endpoint: bulk in endpoint for CPort data
  * @urb: array of urbs for the CPort in messages
@@ -77,6 +93,31 @@ struct es1_cport_out {
 };
 
 /**
+ * cport_to_ep - information about cport to endpoints mapping
+ * @cport_id: the id of cport to map to endpoints
+ * @endpoint_in: the endpoint number to use for in transfer
+ * @endpoint_out: he endpoint number to use for out transfer
+ */
+struct cport_to_ep {
+	__le16 cport_id;
+	__u8 endpoint_in;
+	__u8 endpoint_out;
+};
+
+/**
+ * direct_mapped_ep: structure to manage cport to endpoints mapping
+ * @es1: pointer to the ES1 USB Bridge to AP struct
+ * @ep_pair_map_lock: lock the @ep_pair_map bitmap
+ * @ep_pair_map: bitmap to know which endpoints pair is mapped
+ * @cport_to_ep: array of cport_to_ep struct, to get the cport mapping
+ */
+struct direct_mapped_ep {
+	struct es1_ap_dev *es1;
+	DECLARE_BITMAP(ep_pair_map, NUM_BULKS);
+	struct cport_to_ep cport_to_ep[0];
+};
+
+/**
  * es1_ap_dev - ES1 USB Bridge to AP structure
  * @usb_dev: pointer to the USB device we are.
  * @usb_intf: pointer to the USB interface we are bound to.
@@ -90,6 +131,7 @@ struct es1_cport_out {
  * @cport_out_urb_cancelled: array of flags indicating whether the
  *			corresponding @cport_out_urb is being cancelled
  * @cport_out_urb_lock: locks the @cport_out_urb_busy "list"
+ * @mapped_ep: list of cports and their mapping to endpoints pair
  */
 struct es1_ap_dev {
 	struct usb_device *usb_dev;
@@ -103,19 +145,7 @@ struct es1_ap_dev {
 	bool cport_out_urb_cancelled[NUM_CPORT_OUT_URB];
 	spinlock_t cport_out_urb_lock;
 
-	int *cport_to_ep;
-};
-
-/**
- * cport_to_ep - information about cport to endpoints mapping
- * @cport_id: the id of cport to map to endpoints
- * @endpoint_in: the endpoint number to use for in transfer
- * @endpoint_out: he endpoint number to use for out transfer
- */
-struct cport_to_ep {
-	__le16 cport_id;
-	__u8 endpoint_in;
-	__u8 endpoint_out;
+	struct direct_mapped_ep *mapped_ep;
 };
 
 static inline struct es1_ap_dev *hd_to_es1(struct greybus_host_device *hd)
@@ -127,12 +157,111 @@ static void cport_out_callback(struct urb *urb);
 static void usb_log_enable(struct es1_ap_dev *es1);
 static void usb_log_disable(struct es1_ap_dev *es1);
 
+static inline struct cport_to_ep *get_mapped_ep(struct es1_ap_dev *es1,
+						u16 cport_id)
+{
+	return &es1->mapped_ep->cport_to_ep[cport_id];
+}
+
+/*
+ * Find the first unmapped endpoints pair.
+ * Return a unmapped endpoints pair number or MUXED_EP_PAIR
+ * if we can't find one.
+ */
+static int find_first_unmapped_ep_pair(struct es1_ap_dev *es1)
+{
+	int ep_pair;
+	struct direct_mapped_ep *mapped_ep = es1->mapped_ep;
+
+	ep_pair = find_first_zero_bit(mapped_ep->ep_pair_map, NUM_BULKS);
+	if (ep_pair == NUM_BULKS)
+		ep_pair = MUXED_EP_PAIR;
+	return ep_pair;
+}
+
+/*
+ * Reserve an endpoints pair.
+ * Can fail if the endpoint pair is already mapped.
+ */
+static int reserve_ep_pair(struct es1_ap_dev *es1, int ep_pair)
+{
+	int ret;
+	struct direct_mapped_ep *mapped_ep = es1->mapped_ep;
+
+	/* Muxed endpoints pair doesn't need reservation */
+	if (ep_pair == MUXED_EP_PAIR)
+		return 0;
+
+	/* Reserve the endpoints pair if it is not already mapped */
+	ret = test_and_set_bit(ep_pair, mapped_ep->ep_pair_map);
+	if (ret)
+		return -EBUSY;
+	return 0;
+}
+
+/*
+ * Free the endpoints pair, then it can be re mapped with another cport.
+ */
+static void release_ep_pair(struct es1_ap_dev *es1, int ep_pair)
+{
+	struct direct_mapped_ep *mapped_ep = es1->mapped_ep;
+
+	/* Exit if cport is already unmapped */
+	if (ep_pair == MUXED_EP_PAIR)
+		return;
+
+	clear_bit(ep_pair, mapped_ep->ep_pair_map);
+}
+
+static void mapped_ep_init(struct es1_ap_dev *es1,
+				u16 cport_id, int ep_pair)
+{
+	struct cport_to_ep *cport_to_ep;
+
+	cport_to_ep = get_mapped_ep(es1, cport_id);
+	cport_to_ep->cport_id = cport_id;
+	cport_to_ep->endpoint_out = ep_pair_to_bulk_out(ep_pair);
+	cport_to_ep->endpoint_in = ep_pair_to_bulk_in(ep_pair);
+}
+
+static void muxed_ep_init(struct es1_ap_dev *es1, u16 cport_id)
+{
+	mapped_ep_init(es1, cport_id, MUXED_EP_PAIR);
+}
+
+static struct direct_mapped_ep *direct_mapped_ep_alloc(struct es1_ap_dev *es1,
+							u16 cport_count)
+{
+	struct direct_mapped_ep *mapped_ep;
+
+	mapped_ep = kzalloc(sizeof(struct direct_mapped_ep) +
+				sizeof(struct cport_to_ep) * cport_count,
+				GFP_KERNEL);
+	if (!mapped_ep)
+		return NULL;
+	mapped_ep->es1 = es1;
+	bitmap_zero(mapped_ep->ep_pair_map, cport_count);
+	set_bit(MUXED_EP_PAIR, mapped_ep->ep_pair_map);
+
+	return mapped_ep;
+}
+
+static void direct_mapped_ep_free(struct direct_mapped_ep *mapped_ep)
+{
+	if (!mapped_ep)
+		kfree(mapped_ep);
+}
+
 /* Get the endpoints pair mapped to the cport */
 static int cport_to_ep_pair(struct es1_ap_dev *es1, u16 cport_id)
 {
+	__u8 ep;
+
 	if (cport_id >= es1->hd->num_cports)
 		return 0;
-	return es1->cport_to_ep[cport_id];
+
+	ep = es1->mapped_ep->cport_to_ep[cport_id].endpoint_out;
+	return bulk_out_to_ep_pair(ep);
 }
 
 #define ES1_TIMEOUT	500	/* 500 ms for the SVC to do something */
@@ -142,13 +271,9 @@ static int cport_to_ep_pair(struct es1_ap_dev *es1, u16 cport_id)
 /* Test if the endpoints pair is already mapped to a cport */
 static int ep_pair_in_use(struct es1_ap_dev *es1, int ep_pair)
 {
-	int i;
+	struct direct_mapped_ep *mapped_ep = es1->mapped_ep;
 
-	for (i = 0; i < es1->hd->num_cports; i++) {
-		if (es1->cport_to_ep[i] == ep_pair)
-			return 1;
-	}
-	return 0;
+	return test_bit(ep_pair, mapped_ep->ep_pair_map);
 }
 
 /* Configure the endpoint mapping and send the request to APBridge */
@@ -162,17 +287,11 @@ static int map_cport_to_ep(struct es1_ap_dev *es1,
 		return -EINVAL;
 	if (cport_id >= es1->hd->num_cports)
 		return -EINVAL;
-	if (ep_pair && ep_pair_in_use(es1, ep_pair))
-		return -EINVAL;
+	if (reserve_ep_pair(es1, ep_pair))
+		return -EBUSY;
 
-	cport_to_ep = kmalloc(sizeof(*cport_to_ep), GFP_KERNEL);
-	if (!cport_to_ep)
-		return -ENOMEM;
-
-	es1->cport_to_ep[cport_id] = ep_pair;
-	cport_to_ep->cport_id = cpu_to_le16(cport_id);
-	cport_to_ep->endpoint_in = es1->cport_in[ep_pair].endpoint;
-	cport_to_ep->endpoint_out = es1->cport_out[ep_pair].endpoint;
+	mapped_ep_init(es1, cport_id, ep_pair);
+	cport_to_ep = get_mapped_ep(es1, cport_id);
 
 	retval = usb_control_msg(es1->usb_dev,
 				 usb_sndctrlpipe(es1->usb_dev, 0),
@@ -184,7 +303,6 @@ static int map_cport_to_ep(struct es1_ap_dev *es1,
 				 ES1_TIMEOUT);
 	if (retval == sizeof(*cport_to_ep))
 		retval = 0;
-	kfree(cport_to_ep);
 
 	return retval;
 }
@@ -192,7 +310,13 @@ static int map_cport_to_ep(struct es1_ap_dev *es1,
 /* Unmap a cport: use the muxed endpoints pair */
 static int unmap_cport(struct es1_ap_dev *es1, u16 cport_id)
 {
-	return map_cport_to_ep(es1, cport_id, 0);
+	int ep_pair;
+
+	ep_pair = cport_to_ep_pair(es1, cport_id);
+	release_ep_pair(es1, ep_pair);
+
+	/* Unmap a cport mean use the muxed enpoints pair (0) */
+	return map_cport_to_ep(es1, cport_id, MUXED_EP_PAIR);
 }
 #endif
 
@@ -450,7 +574,7 @@ static void ap_disconnect(struct usb_interface *interface)
 	usb_set_intfdata(interface, NULL);
 	udev = es1->usb_dev;
 	greybus_remove_hd(es1->hd);
-	kfree(es1->cport_to_ep);
+	direct_mapped_ep_free(es1->mapped_ep);
 
 	usb_put_dev(udev);
 }
@@ -722,9 +846,8 @@ static int ap_probe(struct usb_interface *interface,
 	spin_lock_init(&es1->cport_out_urb_lock);
 	usb_set_intfdata(interface, es1);
 
-	es1->cport_to_ep = kcalloc(hd->num_cports, sizeof(*es1->cport_to_ep),
-				   GFP_KERNEL);
-	if (!es1->cport_to_ep) {
+	es1->mapped_ep = direct_mapped_ep_alloc(es1, hd->num_cports);
+	if (!es1->mapped_ep) {
 		retval = -ENOMEM;
 		goto error;
 	}
@@ -778,6 +901,13 @@ static int ap_probe(struct usb_interface *interface,
 				goto error;
 		}
 	}
+
+	/*
+	 * Init default ep to cport mapping. We don't need to use
+	 * map_cport_to_ep because APBA firmware already did it.
+	 */
+	for (i = 0; i < hd->num_cports; i++)
+		muxed_ep_init(es1, i);
 
 	/* Allocate urbs for our CPort OUT messages */
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
