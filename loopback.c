@@ -888,7 +888,7 @@ static int gb_loopback_fn(void *data)
 		mutex_unlock(&gb->mutex);
 
 		mutex_lock(&gb_dev.mutex);
-//		mutex_lock(&gb->mutex);
+		mutex_lock(&gb->mutex);
 
 //		if (error) {
 //			gb_dev.error++;
@@ -897,7 +897,7 @@ static int gb_loopback_fn(void *data)
 //		gb_loopback_calculate_stats(gb);
 		gb->iteration_count++;
 
-//		mutex_unlock(&gb->mutex);
+		mutex_unlock(&gb->mutex);
 unlock_continue:
 		mutex_unlock(&gb_dev.mutex);
 sleep:
