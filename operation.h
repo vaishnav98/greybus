@@ -105,6 +105,8 @@ struct gb_operation {
 
 	int			active;
 	struct list_head	links;		/* connection->operations */
+
+	void			*priv;		/* private data for async */
 };
 
 static inline bool
