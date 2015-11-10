@@ -632,7 +632,7 @@ static int gb_loopback_transfer_callback(struct gb_loopback_async *data)
 	struct gb_loopback_transfer_request *request = data->request;
 	struct gb_loopback_transfer_response *response = data->response;
 
-	if (memcmp(request->data, response->data, data->request_size)) {
+	if (memcmp(request->data, response->data, request->len)) {
 		dev_err(&gb->connection->bundle->dev,
 			"Loopback Data doesn't match\n");
 		retval = -EREMOTEIO;
