@@ -515,16 +515,6 @@ static void gb_loopback_operation_async_callback(struct gb_operation *operation)
 	}
 
 error:
-	gb_operation_put(operation);
-
-	do_gettimeofday(&te);
-
-	/* Calculate the total time the message took */
-	gb_loopback_push_latency_ts(gb, &data->ts, &te);
-	gb->elapsed_nsecs = gb_loopback_calc_latency(&data->ts, &te);
-
-	kfree(data);
-
 //	mutex_lock(&gb_dev.mutex);
 //	mutex_lock(&gb->mutex);
 
@@ -540,6 +530,17 @@ error:
 
 //	mutex_unlock(&gb->mutex);
 //	mutex_unlock(&gb_dev.mutex);
+
+
+	gb_operation_put(operation);
+
+	do_gettimeofday(&te);
+
+	/* Calculate the total time the message took */
+	gb_loopback_push_latency_ts(gb, &data->ts, &te);
+	gb->elapsed_nsecs = gb_loopback_calc_latency(&data->ts, &te);
+
+	kfree(data);
 }
 
 static int gb_loopback_operation_async(struct gb_loopback *gb, int type,
