@@ -890,10 +890,10 @@ static int gb_loopback_fn(void *data)
 		mutex_lock(&gb_dev.mutex);
 		mutex_lock(&gb->mutex);
 
-//		if (error) {
-//			gb_dev.error++;
-//			gb->error++;
-//		}
+		if (error) {
+			gb_dev.error++;
+			gb->error++;
+		}
 //		gb_loopback_calculate_stats(gb);
 		gb->iteration_count++;
 
