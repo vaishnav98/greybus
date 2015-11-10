@@ -627,7 +627,7 @@ static int gb_loopback_sink(struct gb_loopback *gb, u32 len)
 
 static int gb_loopback_transfer_callback(struct gb_loopback_async *data)
 {
-	int retval;
+	int retval = 0;
 	struct gb_loopback *gb = data->gb;
 	struct gb_loopback_transfer_request *request = data->request;
 	struct gb_loopback_transfer_response *response = data->response;
