@@ -525,20 +525,19 @@ error:
 		}
 	}
 
+	do_gettimeofday(&te);
+
+	/* Calculate the total time the message took */
+	gb_loopback_push_latency_ts(gb, &data->ts, &te);
+	gb->elapsed_nsecs = gb_loopback_calc_latency(&data->ts, &te);
+
 	gb_loopback_calculate_stats(gb);
 	gb->iteration_count++;
 
 	mutex_unlock(&gb->mutex);
 	mutex_unlock(&gb_dev.mutex);
 
-
 	gb_operation_put(operation);
-
-	do_gettimeofday(&te);
-
-	/* Calculate the total time the message took */
-	gb_loopback_push_latency_ts(gb, &data->ts, &te);
-	gb->elapsed_nsecs = gb_loopback_calc_latency(&data->ts, &te);
 
 	kfree(data);
 }
