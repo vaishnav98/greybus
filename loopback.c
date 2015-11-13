@@ -90,6 +90,8 @@ struct gb_loopback {
 	u32 error;
 	u32 apbridge_latency_ts;
 	u32 gpbridge_latency_ts;
+
+	struct list_head operations;
 };
 
 struct gb_loopback_async *data;
@@ -105,6 +107,9 @@ struct gb_loopback_async {
 	int response_size;
 
 	gb_loopback_callback callback;
+
+	struct gb_operation *operation;
+	struct list_head list;
 };
 
 #define GB_LOOPBACK_FIFO_DEFAULT			8192
@@ -496,6 +501,9 @@ static void gb_loopback_operation_async_callback(struct gb_operation *operation)
 	data = operation->priv;
 	gb = data->gb;
 
+	if (gb_operation_result(operation) == -ECANCELED)
+		goto cancel;
+
 	if (gb_operation_result(operation)) {
 		gb_dev.error++;
 		gb->error++;
@@ -539,6 +547,8 @@ error:
 
 	gb_operation_put(operation);
 
+cancel:
+	list_del(&data->list);
 	kfree(data);
 }
 
@@ -576,6 +586,8 @@ static int gb_loopback_operation_async(struct gb_loopback *gb, int type,
 	data->request_size = request_size;
 	data->response = response;
 	data->response_size = response_size;
+	data->operation = operation;
+	list_add(&data->list, &gb->operations);
 	operation->priv = data;
 	ret = gb_operation_request_send(operation,
 					gb_loopback_operation_async_callback,
@@ -1031,6 +1043,7 @@ static int gb_loopback_connection_init(struct gb_connection *connection)
 	if (!gb)
 		return -ENOMEM;
 	gb_loopback_reset_stats(&gb_dev);
+	INIT_LIST_HEAD(&gb->operations);
 
 	/* If this is the first connection - create a module endo0 entry */
 	mutex_lock(&gb_dev.mutex);
@@ -1113,6 +1126,8 @@ out_sysfs:
 
 static void gb_loopback_connection_exit(struct gb_connection *connection)
 {
+	struct list_head *iter, *next;
+	struct gb_operation *operation;
 	struct gb_loopback *gb = connection->bundle->private;
 	struct kobject *kobj = &connection->bundle->dev.kobj;
 
@@ -1120,6 +1135,12 @@ static void gb_loopback_connection_exit(struct gb_connection *connection)
 		kthread_stop(gb->task);
 
 	mutex_lock(&gb_dev.mutex);
+
+	/* Cancel in progress operations */
+	list_for_each_safe(iter, next, &gb->operations) {
+		operation = list_entry(iter, struct gb_loopback_async, list)->operation;
+		gb_operation_cancel(operation, -ECANCELED);
+	}
 
 	connection->bundle->private = NULL;
 	kfifo_free(&gb->kfifo_lat);
