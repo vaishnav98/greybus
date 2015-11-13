@@ -515,8 +515,8 @@ static void gb_loopback_operation_async_callback(struct gb_operation *operation)
 	}
 
 error:
-//	mutex_lock(&gb_dev.mutex);
-//	mutex_lock(&gb->mutex);
+	mutex_lock(&gb_dev.mutex);
+	mutex_lock(&gb->mutex);
 
 	if (data->callback) {
 		if (data->callback(data)) {
@@ -528,8 +528,8 @@ error:
 	gb_loopback_calculate_stats(gb);
 	gb->iteration_count++;
 
-//	mutex_unlock(&gb->mutex);
-//	mutex_unlock(&gb_dev.mutex);
+	mutex_unlock(&gb->mutex);
+	mutex_unlock(&gb_dev.mutex);
 
 
 	gb_operation_put(operation);
