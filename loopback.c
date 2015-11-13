@@ -85,7 +85,7 @@ struct gb_loopback {
 
 	u32 lbid;
 	u32 iteration_count;
-	u32 complete_count;
+	u32 sent_count;
 	u64 elapsed_nsecs;
 	u32 error;
 	u32 apbridge_latency_ts;
@@ -258,7 +258,7 @@ static void gb_loopback_check_attr(struct gb_loopback_device *gb_dev,
 	list_for_each_entry(gb, &gb_dev->list, entry) {
 		mutex_lock(&gb->mutex);
 		gb->iteration_count = 0;
-		gb->complete_count = 0;
+		gb->sent_count = 0;
 		gb->error = 0;
 		if (kfifo_depth < gb_dev->iteration_max) {
 			dev_warn(&bundle->dev,
@@ -526,7 +526,7 @@ error:
 	}
 
 	gb_loopback_calculate_stats(gb);
-	gb->complete_count++;
+	gb->iteration_count++;
 
 //	mutex_unlock(&gb->mutex);
 //	mutex_unlock(&gb_dev.mutex);
@@ -845,12 +845,12 @@ static int gb_loopback_fn(void *data)
 		}
 		if (gb_dev.iteration_max) {
 			/* Determine overall lowest count */
-			low_count = gb->complete_count;
+			low_count = gb->iteration_count;
 			list_for_each_entry(gb_list, &gb_dev.list, entry) {
 				if (!gb_loopback_active(gb_list))
 					continue;
-				if (gb_list->complete_count < low_count)
-					low_count = gb_list->complete_count;
+				if (gb_list->iteration_count < low_count)
+					low_count = gb_list->iteration_count;
 			}
 			/* All threads achieved at least low_count iterations */
 			if (gb_dev.iteration_count < low_count) {
@@ -871,7 +871,8 @@ static int gb_loopback_fn(void *data)
 		mutex_unlock(&gb_dev.mutex);
 
 		mutex_lock(&gb->mutex);
-		if (gb->iteration_count >= gb_dev.iteration_max) {
+		if (gb->iteration_count >= gb_dev.iteration_max ||
+			gb->sent_count >= gb_dev.iteration_max) {
 			/* If this thread finished before siblings then sleep */
 			ms_wait = 1;
 			mutex_unlock(&gb->mutex);
@@ -895,8 +896,9 @@ static int gb_loopback_fn(void *data)
 			gb_dev.error++;
 			gb->error++;
 		}
+		gb->sent_count++;
 //		gb_loopback_calculate_stats(gb);
-		gb->iteration_count++;
+//		gb->iteration_count++;
 
 		mutex_unlock(&gb->mutex);
 unlock_continue:
