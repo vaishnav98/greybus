@@ -174,6 +174,56 @@ static inline struct cport_to_ep *get_mapped_ep(struct es2_ap_dev *es2,
 	return &es2->mapped_ep->cport_to_ep[cport_id];
 }
 
+/*
+ * Find the first unmapped endpoints pair.
+ * Return a unmapped endpoints pair number or MUXED_EP_PAIR
+ * if we can't find one.
+ */
+static int find_first_unmapped_ep_pair(struct es2_ap_dev *es2)
+{
+	int ep_pair;
+	struct direct_mapped_ep *mapped_ep = es2->mapped_ep;
+
+	ep_pair = find_first_zero_bit(mapped_ep->ep_pair_map, NUM_BULKS);
+	if (ep_pair == NUM_BULKS)
+		ep_pair = MUXED_EP_PAIR;
+	return ep_pair;
+}
+
+/*
+ * Reserve an endpoints pair.
+ * Can fail if the endpoint pair is already mapped.
+ */
+static int reserve_ep_pair(struct es2_ap_dev *es2, int ep_pair)
+{
+	int ret;
+	struct direct_mapped_ep *mapped_ep = es2->mapped_ep;
+
+	/* Muxed endpoints pair doesn't need reservation */
+	if (ep_pair == MUXED_EP_PAIR)
+		return 0;
+
+	/* Reserve the endpoints pair if it is not already mapped */
+	ret = test_and_set_bit(ep_pair, mapped_ep->ep_pair_map);
+	if (ret)
+		return -EBUSY;
+	return 0;
+}
+
+/*
+ * Free the endpoints pair, then it can be re mapped with another cport.
+ */
+static void release_ep_pair(struct es2_ap_dev *es2, int ep_pair)
+{
+	struct direct_mapped_ep *mapped_ep = es2->mapped_ep;
+
+	/* Exit if cport is already unmapped */
+	if (ep_pair == MUXED_EP_PAIR)
+		return;
+
+	clear_bit(ep_pair, mapped_ep->ep_pair_map);
+}
+
 static void mapped_ep_init(struct es2_ap_dev *es2,
 				u16 cport_id, int ep_pair)
 {
@@ -224,8 +274,6 @@ static int cport_to_ep_pair(struct es2_ap_dev *es2, u16 cport_id)
 
 #define ES2_TIMEOUT	500	/* 500 ms for the SVC to do something */
 
-/* Disable for now until we work all of this out to keep a warning-free build */
-#if 0
 /* Configure the endpoint mapping and send the request to APBridge */
 static int map_cport_to_ep(struct es2_ap_dev *es2,
 				u16 cport_id, int ep_pair)
@@ -237,8 +285,7 @@ static int map_cport_to_ep(struct es2_ap_dev *es2,
 		return -EINVAL;
 	if (cport_id >= es2->hd->num_cports)
 		return -EINVAL;
-	if (ep_pair != MUXED_EP_PAIR &&
-		test_and_set_bit(ep_pair, es2->mapped_ep->ep_pair_map))
+	if (reserve_ep_pair(es2, ep_pair))
 		return -EBUSY;
 
 	cport_to_ep = kmalloc(sizeof(*cport_to_ep), GFP_KERNEL);
@@ -267,9 +314,14 @@ static int map_cport_to_ep(struct es2_ap_dev *es2,
 /* Unmap a cport: use the muxed endpoints pair */
 static int unmap_cport(struct es2_ap_dev *es2, u16 cport_id)
 {
-	return map_cport_to_ep(es2, cport_id, 0);
+	int ep_pair;
+
+	ep_pair = cport_to_ep_pair(es2, cport_id);
+	release_ep_pair(es2, ep_pair);
+
+	/* Unmap a cport mean use the muxed enpoints pair (0) */
+	return map_cport_to_ep(es2, cport_id, MUXED_EP_PAIR);
 }
-#endif
 
 static int es2_cport_in_enable(struct es2_ap_dev *es2,
 				struct es2_cport_in *cport_in)
@@ -515,12 +567,33 @@ static int cport_reset(struct gb_host_device *hd, u16 cport_id)
 static int cport_enable(struct gb_host_device *hd, u16 cport_id)
 {
 	int retval;
+	int ep_pair;
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
 
 	if (cport_id != GB_SVC_CPORT_ID) {
 		retval = cport_reset(hd, cport_id);
 		if (retval)
 			return retval;
 	}
+
+	/*
+	 * Try to get an unmapped endpoints pair.
+	 * Fallback to muxed endpoints pair in case of error.
+	 */
+	ep_pair = find_first_unmapped_ep_pair(es2);
+	retval = map_cport_to_ep(es2, cport_id, ep_pair);
+	if (retval)
+		dev_err(&es2->usb_dev->dev,
+			"Can not map cport to dedicated endpoints\n");
+
+	return 0;
+}
+
+static int cport_disable(struct gb_host_device *hd, u16 cport_id)
+{
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+
+	unmap_cport(es2, cport_id);
 
 	return 0;
 }
@@ -576,6 +649,7 @@ static struct gb_hd_driver es2_driver = {
 	.message_send		= message_send,
 	.message_cancel		= message_cancel,
 	.cport_enable		= cport_enable,
+	.cport_disable		= cport_disable,
 	.latency_tag_enable	= latency_tag_enable,
 	.latency_tag_disable	= latency_tag_disable,
 };
