@@ -27,6 +27,9 @@ static dev_t first;
 static struct class *class;
 static struct gb_host_device *nl_hd;
 
+static int _gb_netlink_init(struct device *dev);
+static void _gb_netlink_exit(void);
+
 static inline struct gb_netlink *hd_to_netlink(struct gb_host_device *hd)
 {
 	return (struct gb_netlink *)&hd->hd_priv;
@@ -139,12 +142,31 @@ static int gb_netlink_msg(struct sk_buff *skb, struct genl_info *info)
 	return 0;
 }
 
+static int gb_netlink_hd_reset(struct sk_buff *skb, struct genl_info *info)
+{
+	struct device *dev;
+	struct gb_host_device *hd = nl_hd;
+
+	dev = hd->dev.parent;
+	_gb_netlink_exit();
+	_gb_netlink_init(dev);
+
+	return 0;
+}
+
 struct genl_ops gb_nl_ops[] = {
 	{
 		.cmd = GB_NL_C_MSG,
 		.flags = 0,
 		.policy = gb_nl_policy,
 		.doit = gb_netlink_msg,
+		.dumpit = NULL,
+	},
+	{
+		.cmd = GB_NL_C_HD_RESET,
+		.flags = 0,
+		.policy = gb_nl_policy,		/* TODO change to NULL */
+		.doit = gb_netlink_hd_reset,
 		.dumpit = NULL,
 	},
 };
@@ -155,7 +177,7 @@ static struct gb_hd_driver tcpip_driver = {
 	.message_cancel		= message_cancel,
 };
 
-static void __exit gb_netlink_exit(void)
+static void _gb_netlink_exit(void)
 {
 	struct gb_host_device *hd = nl_hd;
 
@@ -164,6 +186,12 @@ static void __exit gb_netlink_exit(void)
 
 	gb_hd_del(hd);
 	gb_hd_put(hd);
+	nl_hd = NULL;
+}
+
+static void __exit gb_netlink_exit(void)
+{
+	_gb_netlink_exit();
 
 	unregister_chrdev_region(first, 1);
 	device_destroy(class, first);
@@ -172,13 +200,37 @@ static void __exit gb_netlink_exit(void)
 	genl_unregister_family(&gb_nl_family);
 }
 
+static int _gb_netlink_init(struct device *dev)
+{
+	int retval;
+	struct gb_host_device *hd;
+	struct gb_netlink *gb;
+
+	hd = gb_hd_create(&tcpip_driver, dev, GB_NETLINK_MTU,
+			  GB_NETLINK_NUM_CPORT);
+	if (IS_ERR(hd))
+		return PTR_ERR(hd);
+
+	nl_hd = hd;
+	gb = hd_to_netlink(hd);
+
+	retval = gb_hd_add(hd);
+	if (retval)
+		goto err_gb_hd_del;
+
+	return 0;
+
+err_gb_hd_del:
+	gb_hd_del(hd);
+	gb_hd_put(hd);
+
+	return retval;
+}
+
 static int __init gb_netlink_init(void)
 {
 	int retval;
 	struct device *dev;
-	struct socket *socket = NULL;
-	struct gb_netlink *gb;
-	struct gb_host_device *hd;
 
 	retval = genl_register_family_with_ops(&gb_nl_family, gb_nl_ops);
 	if (retval)
@@ -200,27 +252,12 @@ static int __init gb_netlink_init(void)
 		goto err_class_destroy;
 	}
 
-	hd = gb_hd_create(&tcpip_driver, dev, GB_NETLINK_MTU,
-			  GB_NETLINK_NUM_CPORT);
-	if (IS_ERR(hd)) {
-		retval = PTR_ERR(hd);
-		goto err_device_destroy;
-	}
-
-	nl_hd = hd;
-
-	gb = hd_to_netlink(hd);
-	gb->socket = socket;
-
-	retval = gb_hd_add(hd);
+	retval = _gb_netlink_init(dev);
 	if (retval)
-		goto err_gb_hd_del;
+		goto err_device_destroy;
 
 	return 0;
 
-err_gb_hd_del:
-	gb_hd_del(hd);
-	gb_hd_put(hd);
 err_device_destroy:
 	device_destroy(class, first);
 err_chrdev_unregister:

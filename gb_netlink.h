@@ -26,6 +26,7 @@ enum {
 enum {
 	GB_NL_C_UNSPEC,
 	GB_NL_C_MSG,
+	GB_NL_C_HD_RESET,
 	__GB_NL_C_MAX,
 };
 #define GB_NL_C_MAX (__GB_NL_C_MAX - 1)
