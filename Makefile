@@ -1,69 +1,7 @@
-greybus-y :=	core.o		\
-		debugfs.o	\
-		hd.o		\
-		manifest.o	\
-		module.o	\
-		interface.o	\
-		bundle.o	\
-		connection.o	\
-		protocol.o	\
-		control.o	\
-		svc.o		\
-		svc_watchdog.o	\
-		bootrom.o	\
-		operation.o	\
-		legacy.o
-
-gb-phy-y :=	gpbridge.o	\
-		sdio.o	\
-		uart.o	\
-		pwm.o	\
-		gpio.o	\
-		i2c.o	\
-		spi.o	\
-		usb.o
-
 # Prefix all modules with gb-
-gb-vibrator-y := vibrator.o
-gb-power-supply-y := power_supply.o
-gb-loopback-y := loopback.o
-gb-light-y := light.o
-gb-raw-y := raw.o
-gb-hid-y := hid.o
-gb-es2-y := es2.o
 gb-netlink-y := netlink.o
-gb-arche-y := arche-platform.o arche-apb-ctrl.o
-gb-audio-module-y := audio_module.o audio_topology.o
-gb-audio-codec-y := audio_codec.o
-gb-audio-gb-y := audio_gb.o
-gb-audio-apbridgea-y := audio_apbridgea.o
-gb-audio-manager-y += audio_manager.o
-gb-audio-manager-y += audio_manager_module.o
-gb-camera-y := camera.o
-gb-firmware-y := fw-core.o fw-download.o
 
-obj-m += greybus.o
-obj-m += gb-phy.o
-obj-m += gb-vibrator.o
-obj-m += gb-power-supply.o
-obj-m += gb-loopback.o
-obj-m += gb-light.o
-obj-m += gb-hid.o
-obj-m += gb-raw.o
-obj-m += gb-es2.o
 obj-m += gb-netlink.o
-ifeq ($(CONFIG_USB_HSIC_USB3613),y)
- obj-m += gb-arche.o
-endif
-ifeq ($(CONFIG_ARCH_MSM8994),y)
- obj-m += gb-audio-codec.o
- obj-m += gb-audio-module.o
- obj-m += gb-camera.o
-endif
-obj-m += gb-audio-gb.o
-obj-m += gb-audio-apbridgea.o
-obj-m += gb-audio-manager.o
-obj-m += gb-firmware.o
 
 KERNELVER		?= $(shell uname -r)
 KERNELDIR 		?= /lib/modules/$(KERNELVER)/build
@@ -71,7 +9,7 @@ INSTALL_MOD_PATH	?= /..
 PWD			:= $(shell pwd)
 
 # kernel config option that shall be enable
-CONFIG_OPTIONS_ENABLE := POWER_SUPPLY PWM SYSFS SPI USB SND_SOC MMC LEDS_CLASS INPUT
+CONFIG_OPTIONS_ENABLE := GREYBUS
 
 # kernel config option that shall be disable
 CONFIG_OPTIONS_DISABLE :=
@@ -82,14 +20,6 @@ ifneq ($(KERNELRELEASE),)
 # than the passed version, return 1 if equal or the current kernel version if it
 # is greater than argument version.
 kvers_cmp=$(shell [ "$(KERNELVERSION)" = "$(1)" ] && echo 1 || printf "$(1)\n$(KERNELVERSION)" | sort -V | tail -1)
-
-ifneq ($(call kvers_cmp,"3.19.0"),3.19.0)
-    CONFIG_OPTIONS_ENABLE += LEDS_CLASS_FLASH
-endif
-
-ifneq ($(call kvers_cmp,"4.2.0"),4.2.0)
-    CONFIG_OPTIONS_ENABLE += V4L2_FLASH_LED_CLASS
-endif
 
 $(foreach opt,$(CONFIG_OPTIONS_ENABLE),$(if $(CONFIG_$(opt)),, \
      $(error CONFIG_$(opt) is disabled in the kernel configuration and must be enable \
@@ -104,17 +34,9 @@ ccflags-y := -Wall
 
 # needed for trace events
 ccflags-y += -I$(src)
-
-GB_AUDIO_MANAGER_SYSFS ?= true
-ifeq ($(GB_AUDIO_MANAGER_SYSFS),true)
-gb-audio-manager-y += audio_manager_sysfs.o
-ccflags-y += -DGB_AUDIO_MANAGER_SYSFS
-endif
+ccflags-y += -I$(KERNELDIR)/drivers/staging/greybus
 
 all: module
-
-tools::
-	$(MAKE) -C tools KERNELDIR=$(realpath $(KERNELDIR))
 
 module:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD)
