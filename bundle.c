@@ -1,29 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Greybus bundles
  *
  * Copyright 2014-2015 Google Inc.
  * Copyright 2014-2015 Linaro Ltd.
- *
- * Released under the GPLv2 only.
  */
 
 #include "greybus.h"
+#include "greybus_trace.h"
 
-static ssize_t class_show(struct device *dev, struct device_attribute *attr,
-			  char *buf)
+static ssize_t bundle_class_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
 {
 	struct gb_bundle *bundle = to_gb_bundle(dev);
 
-	return sprintf(buf, "%d\n", bundle->class);
+	return sprintf(buf, "0x%02x\n", bundle->class);
 }
-static DEVICE_ATTR_RO(class);
+static DEVICE_ATTR_RO(bundle_class);
+
+static ssize_t bundle_id_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct gb_bundle *bundle = to_gb_bundle(dev);
+
+	return sprintf(buf, "%u\n", bundle->id);
+}
+static DEVICE_ATTR_RO(bundle_id);
 
 static ssize_t state_show(struct device *dev, struct device_attribute *attr,
 			  char *buf)
 {
 	struct gb_bundle *bundle = to_gb_bundle(dev);
 
-	if (bundle->state == NULL)
+	if (!bundle->state)
 		return sprintf(buf, "\n");
 
 	return sprintf(buf, "%s\n", bundle->state);
@@ -46,99 +55,122 @@ static ssize_t state_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(state);
 
-
 static struct attribute *bundle_attrs[] = {
-	&dev_attr_class.attr,
+	&dev_attr_bundle_class.attr,
+	&dev_attr_bundle_id.attr,
 	&dev_attr_state.attr,
 	NULL,
 };
 
 ATTRIBUTE_GROUPS(bundle);
 
-static void gb_bundle_release(struct device *dev)
+static struct gb_bundle *gb_bundle_find(struct gb_interface *intf,
+					u8 bundle_id)
 {
-	struct gb_bundle *bundle = to_gb_bundle(dev);
+	struct gb_bundle *bundle;
 
-	kfree(bundle->state);
-	kfree(bundle);
-}
-
-struct device_type greybus_bundle_type = {
-	.name =		"greybus_bundle",
-	.release =	gb_bundle_release,
-};
-
-static int gb_bundle_match_one_id(struct gb_bundle *bundle,
-				     const struct greybus_bundle_id *id)
-{
-	if ((id->match_flags & GREYBUS_ID_MATCH_VENDOR) &&
-	    (id->vendor != bundle->intf->vendor))
-		return 0;
-
-	if ((id->match_flags & GREYBUS_ID_MATCH_PRODUCT) &&
-	    (id->product != bundle->intf->product))
-		return 0;
-
-	if ((id->match_flags & GREYBUS_ID_MATCH_SERIAL) &&
-	    (id->unique_id != bundle->intf->unique_id))
-		return 0;
-
-	if ((id->match_flags & GREYBUS_ID_MATCH_CLASS) &&
-	    (id->class != bundle->class))
-		return 0;
-
-	return 1;
-}
-
-const struct greybus_bundle_id *
-gb_bundle_match_id(struct gb_bundle *bundle,
-		   const struct greybus_bundle_id *id)
-{
-	if (id == NULL)
-		return NULL;
-
-	for (; id->vendor || id->product || id->unique_id || id->class ||
-	       id->driver_info; id++) {
-		if (gb_bundle_match_one_id(bundle, id))
-			return id;
+	list_for_each_entry(bundle, &intf->bundles, links) {
+		if (bundle->id == bundle_id)
+			return bundle;
 	}
 
 	return NULL;
 }
 
-
-/* XXX This could be per-host device or per-module */
-static DEFINE_SPINLOCK(gb_bundles_lock);
-
-static int __bundle_bind_protocols(struct device *dev, void *data)
+static void gb_bundle_release(struct device *dev)
 {
-	struct gb_bundle *bundle;
+	struct gb_bundle *bundle = to_gb_bundle(dev);
+
+	trace_gb_bundle_release(bundle);
+
+	kfree(bundle->state);
+	kfree(bundle->cport_desc);
+	kfree(bundle);
+}
+
+#ifdef CONFIG_PM
+static void gb_bundle_disable_all_connections(struct gb_bundle *bundle)
+{
 	struct gb_connection *connection;
 
-	if (!is_gb_bundle(dev))
-		return 0;
+	list_for_each_entry(connection, &bundle->connections, bundle_links)
+		gb_connection_disable(connection);
+}
 
-	bundle = to_gb_bundle(dev);
+static void gb_bundle_enable_all_connections(struct gb_bundle *bundle)
+{
+	struct gb_connection *connection;
 
-	list_for_each_entry(connection, &bundle->connections, bundle_links) {
-		gb_connection_bind_protocol(connection);
+	list_for_each_entry(connection, &bundle->connections, bundle_links)
+		gb_connection_enable(connection);
+}
+
+static int gb_bundle_suspend(struct device *dev)
+{
+	struct gb_bundle *bundle = to_gb_bundle(dev);
+	const struct dev_pm_ops *pm = dev->driver->pm;
+	int ret;
+
+	if (pm && pm->runtime_suspend) {
+		ret = pm->runtime_suspend(&bundle->dev);
+		if (ret)
+			return ret;
+	} else {
+		gb_bundle_disable_all_connections(bundle);
+	}
+
+	ret = gb_control_bundle_suspend(bundle->intf->control, bundle->id);
+	if (ret) {
+		if (pm && pm->runtime_resume)
+			ret = pm->runtime_resume(dev);
+		else
+			gb_bundle_enable_all_connections(bundle);
+
+		return ret;
 	}
 
 	return 0;
 }
 
-/*
- * Walk all bundles in the system, and see if any connections are not bound to a
- * specific prototcol.  If they are not, then try to find one for it and bind it
- * to it.
- *
- * This is called after registering a new protocol.
- */
-void gb_bundle_bind_protocols(void)
+static int gb_bundle_resume(struct device *dev)
 {
-	bus_for_each_dev(&greybus_bus_type, NULL, NULL,
-			 __bundle_bind_protocols);
+	struct gb_bundle *bundle = to_gb_bundle(dev);
+	const struct dev_pm_ops *pm = dev->driver->pm;
+	int ret;
+
+	ret = gb_control_bundle_resume(bundle->intf->control, bundle->id);
+	if (ret)
+		return ret;
+
+	if (pm && pm->runtime_resume) {
+		ret = pm->runtime_resume(dev);
+		if (ret)
+			return ret;
+	} else {
+		gb_bundle_enable_all_connections(bundle);
+	}
+
+	return 0;
 }
+
+static int gb_bundle_idle(struct device *dev)
+{
+	pm_runtime_mark_last_busy(dev);
+	pm_request_autosuspend(dev);
+
+	return 0;
+}
+#endif
+
+static const struct dev_pm_ops gb_bundle_pm_ops = {
+	SET_RUNTIME_PM_OPS(gb_bundle_suspend, gb_bundle_resume, gb_bundle_idle)
+};
+
+struct device_type greybus_bundle_type = {
+	.name =		"greybus_bundle",
+	.release =	gb_bundle_release,
+	.pm =		&gb_bundle_pm_ops,
+};
 
 /*
  * Create a gb_bundle structure to represent a discovered
@@ -149,7 +181,11 @@ struct gb_bundle *gb_bundle_create(struct gb_interface *intf, u8 bundle_id,
 				   u8 class)
 {
 	struct gb_bundle *bundle;
-	int retval;
+
+	if (bundle_id == BUNDLE_ID_NONE) {
+		dev_err(&intf->dev, "can't use bundle id %u\n", bundle_id);
+		return NULL;
+	}
 
 	/*
 	 * Reject any attempt to reuse a bundle id.  We initialize
@@ -157,7 +193,7 @@ struct gb_bundle *gb_bundle_create(struct gb_interface *intf, u8 bundle_id,
 	 * the interface bundle list locked here.
 	 */
 	if (gb_bundle_find(intf, bundle_id)) {
-		pr_err("duplicate bundle id 0x%02hhx\n", bundle_id);
+		dev_err(&intf->dev, "duplicate bundle id %u\n", bundle_id);
 		return NULL;
 	}
 
@@ -170,39 +206,34 @@ struct gb_bundle *gb_bundle_create(struct gb_interface *intf, u8 bundle_id,
 	bundle->class = class;
 	INIT_LIST_HEAD(&bundle->connections);
 
-	/* Build up the bundle device structures and register it with the
-	 * driver core */
 	bundle->dev.parent = &intf->dev;
 	bundle->dev.bus = &greybus_bus_type;
 	bundle->dev.type = &greybus_bundle_type;
 	bundle->dev.groups = bundle_groups;
+	bundle->dev.dma_mask = intf->dev.dma_mask;
 	device_initialize(&bundle->dev);
-	dev_set_name(&bundle->dev, "%s:%d", dev_name(&intf->dev), bundle_id);
+	dev_set_name(&bundle->dev, "%s.%d", dev_name(&intf->dev), bundle_id);
 
-	retval = device_add(&bundle->dev);
-	if (retval) {
-		pr_err("failed to add bundle device for id 0x%02hhx\n",
-			bundle_id);
-		put_device(&bundle->dev);
-		kfree(bundle);
-		return NULL;
-	}
-
-	spin_lock_irq(&gb_bundles_lock);
 	list_add(&bundle->links, &intf->bundles);
-	spin_unlock_irq(&gb_bundles_lock);
+
+	trace_gb_bundle_create(bundle);
 
 	return bundle;
 }
 
-static void gb_bundle_connections_exit(struct gb_bundle *bundle)
+int gb_bundle_add(struct gb_bundle *bundle)
 {
-	struct gb_connection *connection;
-	struct gb_connection *next;
+	int ret;
 
-	list_for_each_entry_safe(connection, next, &bundle->connections,
-				 bundle_links)
-		gb_connection_destroy(connection);
+	ret = device_add(&bundle->dev);
+	if (ret) {
+		dev_err(&bundle->dev, "failed to register bundle: %d\n", ret);
+		return ret;
+	}
+
+	trace_gb_bundle_add(bundle);
+
+	return 0;
 }
 
 /*
@@ -210,25 +241,12 @@ static void gb_bundle_connections_exit(struct gb_bundle *bundle)
  */
 void gb_bundle_destroy(struct gb_bundle *bundle)
 {
-	spin_lock_irq(&gb_bundles_lock);
+	trace_gb_bundle_destroy(bundle);
+
+	if (device_is_registered(&bundle->dev))
+		device_del(&bundle->dev);
+
 	list_del(&bundle->links);
-	spin_unlock_irq(&gb_bundles_lock);
 
-	gb_bundle_connections_exit(bundle);
-	device_unregister(&bundle->dev);
-}
-
-struct gb_bundle *gb_bundle_find(struct gb_interface *intf, u8 bundle_id)
-{
-	struct gb_bundle *bundle;
-
-	spin_lock_irq(&gb_bundles_lock);
-	list_for_each_entry(bundle, &intf->bundles, links)
-		if (bundle->id == bundle_id)
-			goto found;
-	bundle = NULL;
-found:
-	spin_unlock_irq(&gb_bundles_lock);
-
-	return bundle;
+	put_device(&bundle->dev);
 }

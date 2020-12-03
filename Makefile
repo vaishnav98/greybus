@@ -1,49 +1,81 @@
 greybus-y :=	core.o		\
 		debugfs.o	\
+		hd.o		\
 		manifest.o	\
-		endo.o		\
 		module.o	\
 		interface.o	\
 		bundle.o	\
 		connection.o	\
-		protocol.o	\
 		control.o	\
 		svc.o		\
-		firmware.o	\
+		svc_watchdog.o	\
 		operation.o
 
-gb-phy-y :=	gpbridge.o	\
-		sdio.o	\
-		uart.o	\
-		pwm.o	\
-		gpio.o	\
-		hid.o	\
-		i2c.o	\
-		spi.o	\
-		usb.o	\
-		audio.o		\
-		audio-pcm.o	\
-		audio-dai.o	\
-		audio-gb-cmds.o
+gb-gbphy-y := gbphy.o
 
 # Prefix all modules with gb-
 gb-vibrator-y := vibrator.o
-gb-battery-y := battery.o
+gb-power-supply-y := power_supply.o
+gb-log-y := log.o
 gb-loopback-y := loopback.o
-gb-light-y := light.o
+#gb-light-y := light.o
 gb-raw-y := raw.o
-gb-es1-y := es1.o
+gb-hid-y := hid.o
 gb-es2-y := es2.o
+gb-netlink-y := netlink.o
+gb-arche-y := arche-platform.o arche-apb-ctrl.o
+gb-audio-module-y := audio_module.o audio_topology.o
+gb-audio-codec-y := audio_codec.o
+gb-audio-gb-y := audio_gb.o
+gb-audio-apbridgea-y := audio_apbridgea.o
+gb-audio-manager-y += audio_manager.o
+gb-audio-manager-y += audio_manager_module.o
+gb-bootrom-y := bootrom.o
+gb-camera-y := camera.o
+gb-firmware-y := fw-core.o fw-download.o fw-management.o authentication.o
+gb-spilib-y := spilib.o
+gb-sdio-y := sdio.o
+gb-uart-y := uart.o
+gb-pwm-y := pwm.o
+gb-gpio-y := gpio.o
+gb-i2c-y := i2c.o
+gb-usb-y := usb.o
+gb-spi-y := spi.o
+mikrobus-y :=	mikrobus_core.o	mikrobus_manifest.o
+obj-m += mikrobus.o
 
 obj-m += greybus.o
-obj-m += gb-phy.o
+obj-m += gb-gbphy.o
 obj-m += gb-vibrator.o
-obj-m += gb-battery.o
+obj-m += gb-power-supply.o
+obj-m += gb-log.o
 obj-m += gb-loopback.o
-obj-m += gb-light.o
+#obj-m += gb-light.o
+obj-m += gb-hid.o
 obj-m += gb-raw.o
-obj-m += gb-es1.o
 obj-m += gb-es2.o
+obj-m += gb-netlink.o
+ifeq ($(CONFIG_USB_HSIC_USB3613),y)
+ obj-m += gb-arche.o
+endif
+ifeq ($(CONFIG_ARCH_MSM8994),y)
+ obj-m += gb-audio-codec.o
+ obj-m += gb-audio-module.o
+ obj-m += gb-camera.o
+endif
+obj-m += gb-audio-gb.o
+obj-m += gb-audio-apbridgea.o
+obj-m += gb-audio-manager.o
+obj-m += gb-bootrom.o
+obj-m += gb-firmware.o
+obj-m += gb-spilib.o
+obj-m += gb-sdio.o
+obj-m += gb-uart.o
+obj-m += gb-pwm.o
+obj-m += gb-gpio.o
+obj-m += gb-i2c.o
+obj-m += gb-usb.o
+obj-m += gb-spi.o
 
 KERNELVER		?= $(shell uname -r)
 KERNELDIR 		?= /lib/modules/$(KERNELVER)/build
@@ -51,7 +83,7 @@ INSTALL_MOD_PATH	?= /..
 PWD			:= $(shell pwd)
 
 # kernel config option that shall be enable
-CONFIG_OPTIONS_ENABLE := SYSFS SPI USB SND_SOC MMC LEDS_CLASS
+CONFIG_OPTIONS_ENABLE := POWER_SUPPLY PWM SYSFS SPI USB SND_SOC MMC LEDS_CLASS INPUT
 
 # kernel config option that shall be disable
 CONFIG_OPTIONS_DISABLE :=
@@ -62,6 +94,14 @@ ifneq ($(KERNELRELEASE),)
 # than the passed version, return 1 if equal or the current kernel version if it
 # is greater than argument version.
 kvers_cmp=$(shell [ "$(KERNELVERSION)" = "$(1)" ] && echo 1 || printf "$(1)\n$(KERNELVERSION)" | sort -V | tail -1)
+
+ifneq ($(call kvers_cmp,"3.19.0"),3.19.0)
+    CONFIG_OPTIONS_ENABLE += LEDS_CLASS_FLASH
+endif
+
+ifneq ($(call kvers_cmp,"4.2.0"),4.2.0)
+    CONFIG_OPTIONS_ENABLE += V4L2_FLASH_LED_CLASS
+endif
 
 $(foreach opt,$(CONFIG_OPTIONS_ENABLE),$(if $(CONFIG_$(opt)),, \
      $(error CONFIG_$(opt) is disabled in the kernel configuration and must be enable \
@@ -77,7 +117,16 @@ ccflags-y := -Wall
 # needed for trace events
 ccflags-y += -I$(src)
 
+GB_AUDIO_MANAGER_SYSFS ?= true
+ifeq ($(GB_AUDIO_MANAGER_SYSFS),true)
+gb-audio-manager-y += audio_manager_sysfs.o
+ccflags-y += -DGB_AUDIO_MANAGER_SYSFS
+endif
+
 all: module
+
+tools::
+	$(MAKE) -C tools KERNELDIR=$(realpath $(KERNELDIR))
 
 module:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD)
@@ -89,6 +138,7 @@ clean:
 	rm -f *.o *~ core .depend .*.cmd *.ko *.mod.c
 	rm -f Module.markers Module.symvers modules.order
 	rm -rf .tmp_versions Modules.symvers
+	$(MAKE) -C tools clean
 
 coccicheck:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) coccicheck

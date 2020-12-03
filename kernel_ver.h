@@ -17,9 +17,9 @@
 #include <linux/kernel.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
 /* Commit: 297d716 power_supply: Change ownership from driver to core */
-#define DRIVER_OWNS_PSY_STRUCT
+#define CORE_OWNS_PSY_STRUCT
 #endif
 
 #ifndef __ATTR_WO
@@ -140,6 +140,10 @@ static inline void sysfs_remove_groups(struct kobject *kobj,
 #define MMC_DDR52_DEFINED
 #endif
 
+#ifndef MMC_CAP2_CORE_RUNTIME_PM
+#define MMC_CAP2_CORE_RUNTIME_PM	0
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 17, 0)
 #define MMC_POWER_UNDEFINED_SUPPORTED
 #endif
@@ -248,13 +252,6 @@ static inline size_t sg_pcopy_from_buffer(struct scatterlist *sgl,
 	list_entry((ptr)->prev, type, member)
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 17, 0)
-/*
- * Before this version the led classdev did not support groups
- */
-#define LED_HAVE_GROUPS
-#endif
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
 /*
  * At this time the internal API for the set brightness was changed to the async
@@ -267,7 +264,16 @@ static inline size_t sg_pcopy_from_buffer(struct scatterlist *sgl,
 #include <linux/led-class-flash.h>
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
+/*
+ * New change in LED api, the set_sync operation was renamed to set_blocking and
+ * the workqueue is now handle by core. So, only one set operation is need.
+ */
+#undef LED_HAVE_SET_SYNC
+#define LED_HAVE_SET_BLOCKING
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
 /*
  * From this version upper it was introduced the possibility to disable led
  * sysfs entries to handle control of the led device to v4l2, which was
@@ -287,6 +293,129 @@ static inline bool led_sysfs_is_disabled(struct led_classdev *led_cdev)
  */
 #define V4L2_HAVE_FLASH
 #include <media/v4l2-flash-led-class.h>
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+/*
+ * Power supply get by name need to drop reference after call
+ */
+#define PSY_HAVE_PUT
+#endif
+
+/*
+ * General power supply properties that could be absent from various reasons,
+ * like kernel versions or vendor specific versions
+ */
+#ifndef POWER_SUPPLY_PROP_VOLTAGE_BOOT
+	#define POWER_SUPPLY_PROP_VOLTAGE_BOOT	-1
+#endif
+#ifndef POWER_SUPPLY_PROP_CURRENT_BOOT
+	#define POWER_SUPPLY_PROP_CURRENT_BOOT	-1
+#endif
+#ifndef POWER_SUPPLY_PROP_CALIBRATE
+	#define POWER_SUPPLY_PROP_CALIBRATE	-1
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
+#define SPI_DEV_MODALIAS "spidev"
+#define SPI_NOR_MODALIAS "spi-nor"
+#else
+#define SPI_DEV_MODALIAS "spidev"
+#define SPI_NOR_MODALIAS "m25p80"
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 0)
+/* Starting from this version, the spi core handles runtime pm automatically */
+#define SPI_CORE_SUPPORT_PM
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)
+/**
+ * reinit_completion - reinitialize a completion structure
+ * @x:  pointer to completion structure that is to be reinitialized
+ *
+ * This inline function should be used to reinitialize a completion structure
+ * so it can be reused. This is especially important after complete_all() is
+ * used.
+ */
+static inline void reinit_completion(struct completion *x)
+{
+	x->done = 0;
+}
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
+#include <linux/pwm.h>
+/*
+ * pwm_is_enabled() was first defined in 4.3.
+ * PWMF_ENABLED was first defined in 3.5-rc2, but our code is
+ * always newer than that.
+*/
+static inline bool pwm_is_enabled(const struct pwm_device *pwm)
+{
+	return test_bit(PWMF_ENABLED, &pwm->flags);
+}
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
+/**
+ * kstrtobool - convert common user inputs into boolean values
+ * @s: input string
+ * @res: result
+ *
+ * This routine returns 0 iff the first character is one of 'Yy1Nn0', or
+ * [oO][NnFf] for "on" and "off". Otherwise it will return -EINVAL.  Value
+ * pointed to by res is updated upon finding a match.
+ */
+static inline int kstrtobool(const char *s, bool *res)
+{
+	if (!s)
+		return -EINVAL;
+
+	switch (s[0]) {
+	case 'y':
+	case 'Y':
+	case '1':
+		*res = true;
+		return 0;
+	case 'n':
+	case 'N':
+	case '0':
+		*res = false;
+		return 0;
+	case 'o':
+	case 'O':
+		switch (s[1]) {
+		case 'n':
+		case 'N':
+			*res = true;
+			return 0;
+		case 'f':
+		case 'F':
+			*res = false;
+			return 0;
+		default:
+			break;
+		}
+	default:
+		break;
+	}
+
+	return -EINVAL;
+}
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+/*
+ * After commit b2b49ccbdd54 (PM: Kconfig: Set PM_RUNTIME if PM_SLEEP is
+ * selected) PM_RUNTIME is always set if PM is set, so files that are build
+ * conditionally if CONFIG_PM_RUNTIME is set may now be build if CONFIG_PM is
+ * set.
+ */
+
+#ifdef CONFIG_PM
+#define CONFIG_PM_RUNTIME
+#endif /* CONFIG_PM */
 #endif
 
 #endif	/* __GREYBUS_KERNEL_VER_H */

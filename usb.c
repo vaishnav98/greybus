@@ -1,11 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * USB host driver for the Greybus "generic" USB module.
  *
  * Copyright 2014 Google Inc.
  * Copyright 2014 Linaro Ltd.
- *
- * Released under the GPLv2 only.
- *
  */
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -14,10 +12,7 @@
 #include <linux/usb/hcd.h>
 
 #include "greybus.h"
-
-/* Version of the Greybus USB protocol we support */
-#define GB_USB_VERSION_MAJOR		0x00
-#define GB_USB_VERSION_MINOR		0x01
+#include "gbphy.h"
 
 /* Greybus USB request types */
 #define GB_USB_TYPE_HCD_START		0x02
@@ -37,6 +32,7 @@ struct gb_usb_hub_control_response {
 
 struct gb_usb_device {
 	struct gb_connection *connection;
+	struct gbphy_device *gbphy_dev;
 };
 
 static inline struct gb_usb_device *to_gb_usb_device(struct usb_hcd *hcd)
@@ -57,7 +53,7 @@ static void hcd_stop(struct usb_hcd *hcd)
 	ret = gb_operation_sync(dev->connection, GB_USB_TYPE_HCD_STOP,
 				NULL, 0, NULL, 0);
 	if (ret)
-		dev_err(&dev->connection->dev, "HCD stop failed '%d'\n", ret);
+		dev_err(&dev->gbphy_dev->dev, "HCD stop failed '%d'\n", ret);
 }
 
 static int hcd_start(struct usb_hcd *hcd)
@@ -69,7 +65,7 @@ static int hcd_start(struct usb_hcd *hcd)
 	ret = gb_operation_sync(dev->connection, GB_USB_TYPE_HCD_START,
 				NULL, 0, NULL, 0);
 	if (ret) {
-		dev_err(&dev->connection->dev, "HCD start failed '%d'\n", ret);
+		dev_err(&dev->gbphy_dev->dev, "HCD start failed '%d'\n", ret);
 		return ret;
 	}
 
@@ -141,7 +137,7 @@ out:
 	return ret;
 }
 
-static struct hc_driver usb_gb_hc_driver = {
+static const struct hc_driver usb_gb_hc_driver = {
 	.description = "greybus-hcd",
 	.product_desc = "Greybus USB Host Controller",
 	.hcd_priv_size = sizeof(struct gb_usb_device),
@@ -159,23 +155,38 @@ static struct hc_driver usb_gb_hc_driver = {
 	.hub_control = hub_control,
 };
 
-static int gb_usb_connection_init(struct gb_connection *connection)
+static int gb_usb_probe(struct gbphy_device *gbphy_dev,
+			const struct gbphy_device_id *id)
 {
-	struct device *dev = &connection->dev;
+	struct gb_connection *connection;
+	struct device *dev = &gbphy_dev->dev;
 	struct gb_usb_device *gb_usb_dev;
 	struct usb_hcd *hcd;
-
 	int retval;
 
 	hcd = usb_create_hcd(&usb_gb_hc_driver, dev, dev_name(dev));
 	if (!hcd)
 		return -ENOMEM;
 
+	connection = gb_connection_create(gbphy_dev->bundle,
+					  le16_to_cpu(gbphy_dev->cport_desc->id),
+					  NULL);
+	if (IS_ERR(connection)) {
+		retval = PTR_ERR(connection);
+		goto exit_usb_put;
+	}
+
 	gb_usb_dev = to_gb_usb_device(hcd);
 	gb_usb_dev->connection = connection;
-	connection->private = gb_usb_dev;
+	gb_connection_set_data(connection, gb_usb_dev);
+	gb_usb_dev->gbphy_dev = gbphy_dev;
+	gb_gbphy_set_data(gbphy_dev, gb_usb_dev);
 
 	hcd->has_tt = 1;
+
+	retval = gb_connection_enable(connection);
+	if (retval)
+		goto exit_connection_destroy;
 
 	/*
 	 * FIXME: The USB bridged-PHY protocol driver depends on changes to
@@ -184,40 +195,51 @@ static int gb_usb_connection_init(struct gb_connection *connection)
 	 *        Disable for now.
 	 */
 	if (1) {
-		dev_warn(&connection->dev, "USB protocol disabled\n");
+		dev_warn(dev, "USB protocol disabled\n");
 		retval = -EPROTONOSUPPORT;
-		goto err_put_hcd;
+		goto exit_connection_disable;
 	}
 
 	retval = usb_add_hcd(hcd, 0, 0);
 	if (retval)
-		goto err_put_hcd;
+		goto exit_connection_disable;
 
 	return 0;
 
-err_put_hcd:
+exit_connection_disable:
+	gb_connection_disable(connection);
+exit_connection_destroy:
+	gb_connection_destroy(connection);
+exit_usb_put:
 	usb_put_hcd(hcd);
 
 	return retval;
 }
 
-static void gb_usb_connection_exit(struct gb_connection *connection)
+static void gb_usb_remove(struct gbphy_device *gbphy_dev)
 {
-	struct gb_usb_device *gb_usb_dev = connection->private;
+	struct gb_usb_device *gb_usb_dev = gb_gbphy_get_data(gbphy_dev);
+	struct gb_connection *connection = gb_usb_dev->connection;
 	struct usb_hcd *hcd = gb_usb_device_to_hcd(gb_usb_dev);
 
 	usb_remove_hcd(hcd);
+	gb_connection_disable(connection);
+	gb_connection_destroy(connection);
 	usb_put_hcd(hcd);
 }
 
-static struct gb_protocol usb_protocol = {
-	.name			= "usb",
-	.id			= GREYBUS_PROTOCOL_USB,
-	.major			= GB_USB_VERSION_MAJOR,
-	.minor			= GB_USB_VERSION_MINOR,
-	.connection_init	= gb_usb_connection_init,
-	.connection_exit	= gb_usb_connection_exit,
-	.request_recv		= NULL,	/* FIXME we have requests!!! */
+static const struct gbphy_device_id gb_usb_id_table[] = {
+	{ GBPHY_PROTOCOL(GREYBUS_PROTOCOL_USB) },
+	{ },
+};
+MODULE_DEVICE_TABLE(gbphy, gb_usb_id_table);
+
+static struct gbphy_driver usb_driver = {
+	.name		= "usb",
+	.probe		= gb_usb_probe,
+	.remove		= gb_usb_remove,
+	.id_table	= gb_usb_id_table,
 };
 
-gb_builtin_protocol_driver(usb_protocol);
+module_gbphy_driver(usb_driver);
+MODULE_LICENSE("GPL v2");

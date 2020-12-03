@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Greybus manifest definition
  *
@@ -13,37 +14,48 @@
 #ifndef __GREYBUS_MANIFEST_H
 #define __GREYBUS_MANIFEST_H
 
+#include <linux/bits.h>
+#include <linux/types.h>
+
 enum greybus_descriptor_type {
 	GREYBUS_TYPE_INVALID		= 0x00,
 	GREYBUS_TYPE_INTERFACE		= 0x01,
 	GREYBUS_TYPE_STRING		= 0x02,
 	GREYBUS_TYPE_BUNDLE		= 0x03,
 	GREYBUS_TYPE_CPORT		= 0x04,
+	GREYBUS_TYPE_MIKROBUS		= 0x05,
+	GREYBUS_TYPE_PROPERTY		= 0x06,
+	GREYBUS_TYPE_DEVICE		= 0x07,
 };
 
 enum greybus_protocol {
 	GREYBUS_PROTOCOL_CONTROL	= 0x00,
-	GREYBUS_PROTOCOL_AP		= 0x01,
+	/* 0x01 is unused */
 	GREYBUS_PROTOCOL_GPIO		= 0x02,
 	GREYBUS_PROTOCOL_I2C		= 0x03,
 	GREYBUS_PROTOCOL_UART		= 0x04,
 	GREYBUS_PROTOCOL_HID		= 0x05,
 	GREYBUS_PROTOCOL_USB		= 0x06,
 	GREYBUS_PROTOCOL_SDIO		= 0x07,
-	GREYBUS_PROTOCOL_BATTERY	= 0x08,
+	GREYBUS_PROTOCOL_POWER_SUPPLY	= 0x08,
 	GREYBUS_PROTOCOL_PWM		= 0x09,
-	GREYBUS_PROTOCOL_I2S_MGMT	= 0x0a,
+	/* 0x0a is unused */
 	GREYBUS_PROTOCOL_SPI		= 0x0b,
 	GREYBUS_PROTOCOL_DISPLAY	= 0x0c,
-	GREYBUS_PROTOCOL_CAMERA		= 0x0d,
+	GREYBUS_PROTOCOL_CAMERA_MGMT	= 0x0d,
 	GREYBUS_PROTOCOL_SENSOR		= 0x0e,
 	GREYBUS_PROTOCOL_LIGHTS		= 0x0f,
 	GREYBUS_PROTOCOL_VIBRATOR	= 0x10,
 	GREYBUS_PROTOCOL_LOOPBACK	= 0x11,
-	GREYBUS_PROTOCOL_I2S_RECEIVER	= 0x12,
-	GREYBUS_PROTOCOL_I2S_TRANSMITTER = 0x13,
+	GREYBUS_PROTOCOL_AUDIO_MGMT	= 0x12,
+	GREYBUS_PROTOCOL_AUDIO_DATA	= 0x13,
 	GREYBUS_PROTOCOL_SVC            = 0x14,
-	GREYBUS_PROTOCOL_FIRMWARE	= 0x15,
+	GREYBUS_PROTOCOL_BOOTROM	= 0x15,
+	GREYBUS_PROTOCOL_CAMERA_DATA	= 0x16,
+	GREYBUS_PROTOCOL_FW_DOWNLOAD	= 0x17,
+	GREYBUS_PROTOCOL_FW_MANAGEMENT	= 0x18,
+	GREYBUS_PROTOCOL_AUTHENTICATION	= 0x19,
+	GREYBUS_PROTOCOL_LOG		= 0x1a,
 		/* ... */
 	GREYBUS_PROTOCOL_RAW		= 0xfe,
 	GREYBUS_PROTOCOL_VENDOR		= 0xff,
@@ -51,30 +63,36 @@ enum greybus_protocol {
 
 enum greybus_class_type {
 	GREYBUS_CLASS_CONTROL		= 0x00,
-	GREYBUS_CLASS_AP		= 0x01,
-	GREYBUS_CLASS_GPIO		= 0x02,
-	GREYBUS_CLASS_I2C		= 0x03,
-	GREYBUS_CLASS_UART		= 0x04,
+	/* 0x01 is unused */
+	/* 0x02 is unused */
+	/* 0x03 is unused */
+	/* 0x04 is unused */
 	GREYBUS_CLASS_HID		= 0x05,
-	GREYBUS_CLASS_USB		= 0x06,
-	GREYBUS_CLASS_SDIO		= 0x07,
-	GREYBUS_CLASS_BATTERY		= 0x08,
-	GREYBUS_CLASS_PWM		= 0x09,
-	GREYBUS_CLASS_I2S		= 0x0a,
-	GREYBUS_CLASS_SPI		= 0x0b,
+	/* 0x06 is unused */
+	/* 0x07 is unused */
+	GREYBUS_CLASS_POWER_SUPPLY	= 0x08,
+	/* 0x09 is unused */
+	GREYBUS_CLASS_BRIDGED_PHY	= 0x0a,
+	/* 0x0b is unused */
 	GREYBUS_CLASS_DISPLAY		= 0x0c,
 	GREYBUS_CLASS_CAMERA		= 0x0d,
 	GREYBUS_CLASS_SENSOR		= 0x0e,
 	GREYBUS_CLASS_LIGHTS		= 0x0f,
 	GREYBUS_CLASS_VIBRATOR		= 0x10,
 	GREYBUS_CLASS_LOOPBACK		= 0x11,
-	GREYBUS_CLASS_I2S_RECEIVER	= 0x12,
-	GREYBUS_CLASS_I2S_TRANSMITTER	= 0x13,
-	GREYBUS_CLASS_SVC		= 0x14,
-	GREYBUS_CLASS_FIRMWARE		= 0x15,
+	GREYBUS_CLASS_AUDIO		= 0x12,
+	/* 0x13 is unused */
+	/* 0x14 is unused */
+	GREYBUS_CLASS_BOOTROM		= 0x15,
+	GREYBUS_CLASS_FW_MANAGEMENT	= 0x16,
+	GREYBUS_CLASS_LOG		= 0x17,
 		/* ... */
 	GREYBUS_CLASS_RAW		= 0xfe,
 	GREYBUS_CLASS_VENDOR		= 0xff,
+};
+
+enum {
+	GREYBUS_INTERFACE_FEATURE_TIMESYNC = BIT(0),
 };
 
 /*
@@ -95,7 +113,8 @@ struct greybus_descriptor_string {
 struct greybus_descriptor_interface {
 	__u8	vendor_stringid;
 	__u8	product_stringid;
-	__u8	pad[2];
+	__u8	features;
+	__u8	pad;
 } __packed;
 
 /*
@@ -135,6 +154,49 @@ struct greybus_descriptor_cport {
 	__u8	protocol_id;	/* enum greybus_protocol */
 } __packed;
 
+/*
+ * A mikrobus descriptor is used to describe the details
+ * about the bus ocnfiguration for the add-on board
+ * connected to the mikrobus port.
+ */
+struct greybus_descriptor_mikrobus {
+	__u8 pin_state[12];
+} __packed;
+
+/*
+ * A property descriptor is used to pass named properties
+ * to device drivers through the unified device properties
+ * interface under linux/property.h
+ */
+struct greybus_descriptor_property {
+	__u8 length;
+	__u8 id;
+	__u8 propname_stringid;
+	__u8 type;
+	__u8 value[0];
+} __packed;
+
+/*
+ * A device descriptor is used to describe the
+ * details required by a add-on board device
+ * driver.
+ */
+struct greybus_descriptor_device {
+	__u8 id;
+	__u8 driver_stringid;
+	__u8 protocol;
+	__u8 reg;
+	__le32 max_speed_hz;
+	__u8 irq;
+	__u8 irq_type;
+	__u8 mode;
+	__u8 prop_link;
+	__u8 gpio_link;
+	__u8 reg_link;
+	__u8 clock_link;
+	__u8 pad[1];
+} __packed;
+
 struct greybus_descriptor_header {
 	__le16	size;
 	__u8	type;		/* enum greybus_descriptor_type */
@@ -148,6 +210,9 @@ struct greybus_descriptor {
 		struct greybus_descriptor_interface	interface;
 		struct greybus_descriptor_bundle	bundle;
 		struct greybus_descriptor_cport		cport;
+		struct greybus_descriptor_mikrobus	mikrobus;
+		struct greybus_descriptor_property	property;
+		struct greybus_descriptor_device	device;
 	};
 } __packed;
 

@@ -1,21 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * GPIO Greybus driver.
  *
  * Copyright 2014 Google Inc.
  * Copyright 2014 Linaro Ltd.
- *
- * Released under the GPLv2 only.
  */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/gpio.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
+#include <linux/gpio/driver.h>
 #include <linux/mutex.h>
 
 #include "greybus.h"
+#include "gbphy.h"
 
 struct gb_gpio_line {
 	/* The following has to be an array of line_max entries */
@@ -31,20 +31,6 @@ struct gb_gpio_line {
 	bool			masked_pending;
 };
 
-struct gb_gpio_controller {
-	struct gb_connection	*connection;
-	u8			line_max;	/* max line number */
-	struct gb_gpio_line	*lines;
-
-	struct gpio_chip	chip;
-	struct irq_chip		irqc;
-	struct irq_chip		*irqchip;
-	struct irq_domain	*irqdomain;
-	unsigned int		irq_base;
-	irq_flow_handler_t	irq_handler;
-	unsigned int		irq_default_type;
-	struct mutex		irq_lock;
-};
 #define gpio_chip_to_gb_gpio_controller(chip) \
 	container_of(chip, struct gb_gpio_controller, chip)
 #define irq_data_to_gpio_chip(d) (d->domain->host_data)
@@ -64,37 +50,52 @@ static int gb_gpio_line_count_operation(struct gb_gpio_controller *ggc)
 static int gb_gpio_activate_operation(struct gb_gpio_controller *ggc, u8 which)
 {
 	struct gb_gpio_activate_request request;
+	struct gbphy_device *gbphy_dev = ggc->gbphy_dev;
 	int ret;
+
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		return ret;
 
 	request.which = which;
 	ret = gb_operation_sync(ggc->connection, GB_GPIO_TYPE_ACTIVATE,
-				 &request, sizeof(request), NULL, 0);
-	if (!ret)
-		ggc->lines[which].active = true;
-	return ret;
+				&request, sizeof(request), NULL, 0);
+	if (ret) {
+		gbphy_runtime_put_autosuspend(gbphy_dev);
+		return ret;
+	}
+
+	ggc->lines[which].active = true;
+
+	return 0;
 }
 
 static void gb_gpio_deactivate_operation(struct gb_gpio_controller *ggc,
-					u8 which)
+					 u8 which)
 {
+	struct gbphy_device *gbphy_dev = ggc->gbphy_dev;
+	struct device *dev = &gbphy_dev->dev;
 	struct gb_gpio_deactivate_request request;
 	int ret;
 
 	request.which = which;
 	ret = gb_operation_sync(ggc->connection, GB_GPIO_TYPE_DEACTIVATE,
-				 &request, sizeof(request), NULL, 0);
+				&request, sizeof(request), NULL, 0);
 	if (ret) {
-		dev_err(ggc->chip.dev, "failed to deactivate gpio %u\n",
-			which);
-		return;
+		dev_err(dev, "failed to deactivate gpio %u\n", which);
+		goto out_pm_put;
 	}
 
 	ggc->lines[which].active = false;
+
+out_pm_put:
+	gbphy_runtime_put_autosuspend(gbphy_dev);
 }
 
 static int gb_gpio_get_direction_operation(struct gb_gpio_controller *ggc,
-					u8 which)
+					   u8 which)
 {
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_get_direction_request request;
 	struct gb_gpio_get_direction_response response;
 	int ret;
@@ -109,8 +110,7 @@ static int gb_gpio_get_direction_operation(struct gb_gpio_controller *ggc,
 
 	direction = response.direction;
 	if (direction && direction != 1) {
-		dev_warn(ggc->chip.dev,
-			 "gpio %u direction was %u (should be 0 or 1)\n",
+		dev_warn(dev, "gpio %u direction was %u (should be 0 or 1)\n",
 			 which, direction);
 	}
 	ggc->lines[which].direction = direction ? 1 : 0;
@@ -118,7 +118,7 @@ static int gb_gpio_get_direction_operation(struct gb_gpio_controller *ggc,
 }
 
 static int gb_gpio_direction_in_operation(struct gb_gpio_controller *ggc,
-					u8 which)
+					  u8 which)
 {
 	struct gb_gpio_direction_in_request request;
 	int ret;
@@ -132,7 +132,7 @@ static int gb_gpio_direction_in_operation(struct gb_gpio_controller *ggc,
 }
 
 static int gb_gpio_direction_out_operation(struct gb_gpio_controller *ggc,
-					u8 which, bool value_high)
+					   u8 which, bool value_high)
 {
 	struct gb_gpio_direction_out_request request;
 	int ret;
@@ -147,8 +147,9 @@ static int gb_gpio_direction_out_operation(struct gb_gpio_controller *ggc,
 }
 
 static int gb_gpio_get_value_operation(struct gb_gpio_controller *ggc,
-					u8 which)
+				       u8 which)
 {
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_get_value_request request;
 	struct gb_gpio_get_value_response response;
 	int ret;
@@ -159,15 +160,13 @@ static int gb_gpio_get_value_operation(struct gb_gpio_controller *ggc,
 				&request, sizeof(request),
 				&response, sizeof(response));
 	if (ret) {
-		dev_err(ggc->chip.dev, "failed to get value of gpio %u\n",
-			which);
+		dev_err(dev, "failed to get value of gpio %u\n", which);
 		return ret;
 	}
 
 	value = response.value;
 	if (value && value != 1) {
-		dev_warn(ggc->chip.dev,
-			 "gpio %u value was %u (should be 0 or 1)\n",
+		dev_warn(dev, "gpio %u value was %u (should be 0 or 1)\n",
 			 which, value);
 	}
 	ggc->lines[which].value = value ? 1 : 0;
@@ -177,12 +176,13 @@ static int gb_gpio_get_value_operation(struct gb_gpio_controller *ggc,
 static void gb_gpio_set_value_operation(struct gb_gpio_controller *ggc,
 					u8 which, bool value_high)
 {
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_set_value_request request;
 	int ret;
 
 	if (ggc->lines[which].direction == 1) {
-		dev_warn(ggc->chip.dev,
-			 "refusing to set value of input gpio %u\n", which);
+		dev_warn(dev, "refusing to set value of input gpio %u\n",
+			 which);
 		return;
 	}
 
@@ -191,8 +191,7 @@ static void gb_gpio_set_value_operation(struct gb_gpio_controller *ggc,
 	ret = gb_operation_sync(ggc->connection, GB_GPIO_TYPE_SET_VALUE,
 				&request, sizeof(request), NULL, 0);
 	if (ret) {
-		dev_err(ggc->chip.dev, "failed to set value of gpio %u\n",
-			which);
+		dev_err(dev, "failed to set value of gpio %u\n", which);
 		return;
 	}
 
@@ -200,7 +199,7 @@ static void gb_gpio_set_value_operation(struct gb_gpio_controller *ggc,
 }
 
 static int gb_gpio_set_debounce_operation(struct gb_gpio_controller *ggc,
-					u8 which, u16 debounce_usec)
+					  u8 which, u16 debounce_usec)
 {
 	struct gb_gpio_set_debounce_request request;
 	int ret;
@@ -216,6 +215,7 @@ static int gb_gpio_set_debounce_operation(struct gb_gpio_controller *ggc,
 
 static void _gb_gpio_irq_mask(struct gb_gpio_controller *ggc, u8 hwirq)
 {
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_irq_mask_request request;
 	int ret;
 
@@ -224,11 +224,12 @@ static void _gb_gpio_irq_mask(struct gb_gpio_controller *ggc, u8 hwirq)
 				GB_GPIO_TYPE_IRQ_MASK,
 				&request, sizeof(request), NULL, 0);
 	if (ret)
-		dev_err(ggc->chip.dev, "failed to mask irq: %d\n", ret);
+		dev_err(dev, "failed to mask irq: %d\n", ret);
 }
 
 static void _gb_gpio_irq_unmask(struct gb_gpio_controller *ggc, u8 hwirq)
 {
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_irq_unmask_request request;
 	int ret;
 
@@ -237,12 +238,13 @@ static void _gb_gpio_irq_unmask(struct gb_gpio_controller *ggc, u8 hwirq)
 				GB_GPIO_TYPE_IRQ_UNMASK,
 				&request, sizeof(request), NULL, 0);
 	if (ret)
-		dev_err(ggc->chip.dev, "failed to unmask irq: %d\n", ret);
+		dev_err(dev, "failed to unmask irq: %d\n", ret);
 }
 
 static void _gb_gpio_irq_set_type(struct gb_gpio_controller *ggc,
-					u8 hwirq, u8 type)
+				  u8 hwirq, u8 type)
 {
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_irq_type_request request;
 	int ret;
 
@@ -253,7 +255,7 @@ static void _gb_gpio_irq_set_type(struct gb_gpio_controller *ggc,
 				GB_GPIO_TYPE_IRQ_TYPE,
 				&request, sizeof(request), NULL, 0);
 	if (ret)
-		dev_err(ggc->chip.dev, "failed to set irq type: %d\n", ret);
+		dev_err(dev, "failed to set irq type: %d\n", ret);
 }
 
 static void gb_gpio_irq_mask(struct irq_data *d)
@@ -281,6 +283,7 @@ static int gb_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 	struct gpio_chip *chip = irq_data_to_gpio_chip(d);
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 	struct gb_gpio_line *line = &ggc->lines[d->hwirq];
+	struct device *dev = &ggc->gbphy_dev->dev;
 	u8 irq_type;
 
 	switch (type) {
@@ -303,7 +306,7 @@ static int gb_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 		irq_type = GB_GPIO_IRQ_TYPE_LEVEL_HIGH;
 		break;
 	default:
-		dev_err(chip->dev, "unsupported irq type: %u\n", type);
+		dev_err(dev, "unsupported irq type: %u\n", type);
 		return -EINVAL;
 	}
 
@@ -343,72 +346,69 @@ static void gb_gpio_irq_bus_sync_unlock(struct irq_data *d)
 	mutex_unlock(&ggc->irq_lock);
 }
 
-static int gb_gpio_request_recv(u8 type, struct gb_operation *op)
+static int gb_gpio_request_handler(struct gb_operation *op)
 {
 	struct gb_connection *connection = op->connection;
-	struct gb_gpio_controller *ggc = connection->private;
+	struct gb_gpio_controller *ggc = gb_connection_get_data(connection);
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_message *request;
 	struct gb_gpio_irq_event_request *event;
+	u8 type = op->type;
 	int irq;
 	struct irq_desc *desc;
 
 	if (type != GB_GPIO_TYPE_IRQ_EVENT) {
-		dev_err(&connection->dev,
-			"unsupported unsolicited request: %u\n", type);
+		dev_err(dev, "unsupported unsolicited request: %u\n", type);
 		return -EINVAL;
 	}
 
 	request = op->request;
 
 	if (request->payload_size < sizeof(*event)) {
-		dev_err(ggc->chip.dev, "short event received (%zu < %zu)\n",
+		dev_err(dev, "short event received (%zu < %zu)\n",
 			request->payload_size, sizeof(*event));
 		return -EINVAL;
 	}
 
 	event = request->payload;
 	if (event->which > ggc->line_max) {
-		dev_err(ggc->chip.dev, "invalid hw irq: %d\n", event->which);
+		dev_err(dev, "invalid hw irq: %d\n", event->which);
 		return -EINVAL;
 	}
 
-	irq = irq_find_mapping(ggc->irqdomain, event->which);
+	irq = irq_find_mapping(ggc->chip.irq.domain, event->which);
 	if (!irq) {
-		dev_err(ggc->chip.dev, "failed to find IRQ\n");
+		dev_err(dev, "failed to find IRQ\n");
 		return -EINVAL;
 	}
 	desc = irq_to_desc(irq);
 	if (!desc) {
-		dev_err(ggc->chip.dev, "failed to look up irq\n");
+		dev_err(dev, "failed to look up irq\n");
 		return -EINVAL;
 	}
 
 	local_irq_disable();
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
-	generic_handle_irq_desc(irq, desc);
-#else
 	generic_handle_irq_desc(desc);
-#endif
 	local_irq_enable();
 
 	return 0;
 }
 
-static int gb_gpio_request(struct gpio_chip *chip, unsigned offset)
+static int gb_gpio_request(struct gpio_chip *chip, unsigned int offset)
 {
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 
 	return gb_gpio_activate_operation(ggc, (u8)offset);
 }
 
-static void gb_gpio_free(struct gpio_chip *chip, unsigned offset)
+static void gb_gpio_free(struct gpio_chip *chip, unsigned int offset)
 {
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 
 	gb_gpio_deactivate_operation(ggc, (u8)offset);
 }
 
-static int gb_gpio_get_direction(struct gpio_chip *chip, unsigned offset)
+static int gb_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
 {
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 	u8 which;
@@ -422,22 +422,22 @@ static int gb_gpio_get_direction(struct gpio_chip *chip, unsigned offset)
 	return ggc->lines[which].direction ? 1 : 0;
 }
 
-static int gb_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
+static int gb_gpio_direction_input(struct gpio_chip *chip, unsigned int offset)
 {
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 
 	return gb_gpio_direction_in_operation(ggc, (u8)offset);
 }
 
-static int gb_gpio_direction_output(struct gpio_chip *chip, unsigned offset,
-					int value)
+static int gb_gpio_direction_output(struct gpio_chip *chip, unsigned int offset,
+				    int value)
 {
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 
 	return gb_gpio_direction_out_operation(ggc, (u8)offset, !!value);
 }
 
-static int gb_gpio_get(struct gpio_chip *chip, unsigned offset)
+static int gb_gpio_get(struct gpio_chip *chip, unsigned int offset)
 {
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 	u8 which;
@@ -451,24 +451,27 @@ static int gb_gpio_get(struct gpio_chip *chip, unsigned offset)
 	return ggc->lines[which].value;
 }
 
-static void gb_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
+static void gb_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
 {
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 
 	gb_gpio_set_value_operation(ggc, (u8)offset, !!value);
 }
 
-static int gb_gpio_set_debounce(struct gpio_chip *chip, unsigned offset,
-					unsigned debounce)
+static int gb_gpio_set_config(struct gpio_chip *chip, unsigned int offset,
+			      unsigned long config)
 {
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
-	u16 usec;
+	u32 debounce;
 
+	if (pinconf_to_config_param(config) != PIN_CONFIG_INPUT_DEBOUNCE)
+		return -ENOTSUPP;
+
+	debounce = pinconf_to_config_argument(config);
 	if (debounce > U16_MAX)
 		return -EINVAL;
-	usec = (u16)debounce;
 
-	return gb_gpio_set_debounce_operation(ggc, (u8)offset, usec);
+	return gb_gpio_set_debounce_operation(ggc, (u8)offset, (u16)debounce);
 }
 
 static int gb_gpio_controller_setup(struct gb_gpio_controller *ggc)
@@ -488,145 +491,10 @@ static int gb_gpio_controller_setup(struct gb_gpio_controller *ggc)
 	return ret;
 }
 
-/**
- * gb_gpio_irq_map() - maps an IRQ into a GB gpio irqchip
- * @d: the irqdomain used by this irqchip
- * @irq: the global irq number used by this GB gpio irqchip irq
- * @hwirq: the local IRQ/GPIO line offset on this GB gpio
- *
- * This function will set up the mapping for a certain IRQ line on a
- * GB gpio by assigning the GB gpio as chip data, and using the irqchip
- * stored inside the GB gpio.
- */
-static int gb_gpio_irq_map(struct irq_domain *domain, unsigned int irq,
-			   irq_hw_number_t hwirq)
+static int gb_gpio_probe(struct gbphy_device *gbphy_dev,
+			 const struct gbphy_device_id *id)
 {
-	struct gpio_chip *chip = domain->host_data;
-	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
-
-	irq_set_chip_data(irq, ggc);
-	irq_set_chip_and_handler(irq, ggc->irqchip, ggc->irq_handler);
-#ifdef CONFIG_ARM
-	set_irq_flags(irq, IRQF_VALID);
-#else
-	irq_set_noprobe(irq);
-#endif
-	/*
-	 * No set-up of the hardware will happen if IRQ_TYPE_NONE
-	 * is passed as default type.
-	 */
-	if (ggc->irq_default_type != IRQ_TYPE_NONE)
-		irq_set_irq_type(irq, ggc->irq_default_type);
-
-	return 0;
-}
-
-static void gb_gpio_irq_unmap(struct irq_domain *d, unsigned int irq)
-{
-#ifdef CONFIG_ARM
-	set_irq_flags(irq, 0);
-#endif
-	irq_set_chip_and_handler(irq, NULL, NULL);
-	irq_set_chip_data(irq, NULL);
-}
-
-static const struct irq_domain_ops gb_gpio_domain_ops = {
-	.map	= gb_gpio_irq_map,
-	.unmap	= gb_gpio_irq_unmap,
-};
-
-/**
- * gb_gpio_irqchip_remove() - removes an irqchip added to a gb_gpio_controller
- * @ggc: the gb_gpio_controller to remove the irqchip from
- *
- * This is called only from gb_gpio_remove()
- */
-static void gb_gpio_irqchip_remove(struct gb_gpio_controller *ggc)
-{
-	unsigned int offset;
-
-	/* Remove all IRQ mappings and delete the domain */
-	if (ggc->irqdomain) {
-		for (offset = 0; offset < (ggc->line_max + 1); offset++)
-			irq_dispose_mapping(irq_find_mapping(ggc->irqdomain, offset));
-		irq_domain_remove(ggc->irqdomain);
-	}
-
-	if (ggc->irqchip) {
-		ggc->irqchip = NULL;
-	}
-}
-
-
-/**
- * gb_gpio_irqchip_add() - adds an irqchip to a gpio chip
- * @chip: the gpio chip to add the irqchip to
- * @irqchip: the irqchip to add to the adapter
- * @first_irq: if not dynamically assigned, the base (first) IRQ to
- * allocate gpio irqs from
- * @handler: the irq handler to use (often a predefined irq core function)
- * @type: the default type for IRQs on this irqchip, pass IRQ_TYPE_NONE
- * to have the core avoid setting up any default type in the hardware.
- *
- * This function closely associates a certain irqchip with a certain
- * gpio chip, providing an irq domain to translate the local IRQs to
- * global irqs, and making sure that the gpio chip
- * is passed as chip data to all related functions. Driver callbacks
- * need to use container_of() to get their local state containers back
- * from the gpio chip passed as chip data. An irqdomain will be stored
- * in the gpio chip that shall be used by the driver to handle IRQ number
- * translation. The gpio chip will need to be initialized and registered
- * before calling this function.
- */
-static int gb_gpio_irqchip_add(struct gpio_chip *chip,
-			 struct irq_chip *irqchip,
-			 unsigned int first_irq,
-			 irq_flow_handler_t handler,
-			 unsigned int type)
-{
-	struct gb_gpio_controller *ggc;
-	unsigned int offset;
-	unsigned irq_base;
-
-	if (!chip || !irqchip)
-		return -EINVAL;
-
-	ggc = gpio_chip_to_gb_gpio_controller(chip);
-
-	ggc->irqchip = irqchip;
-	ggc->irq_handler = handler;
-	ggc->irq_default_type = type;
-	ggc->irqdomain = irq_domain_add_simple(NULL,
-					ggc->line_max + 1, first_irq,
-					&gb_gpio_domain_ops, chip);
-	if (!ggc->irqdomain) {
-		ggc->irqchip = NULL;
-		return -EINVAL;
-	}
-
-	/*
-	 * Prepare the mapping since the irqchip shall be orthogonal to
-	 * any gpio calls. If the first_irq was zero, this is
-	 * necessary to allocate descriptors for all IRQs.
-	 */
-	for (offset = 0; offset < (ggc->line_max + 1); offset++) {
-		irq_base = irq_create_mapping(ggc->irqdomain, offset);
-		if (offset == 0)
-			ggc->irq_base = irq_base;
-	}
-
-	return 0;
-}
-
-static int gb_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
-{
-	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
-
-	return irq_find_mapping(ggc->irqdomain, offset);
-}
-
-static int gb_gpio_connection_init(struct gb_connection *connection)
-{
+	struct gb_connection *connection;
 	struct gb_gpio_controller *ggc;
 	struct gpio_chip *gpio;
 	struct irq_chip *irqc;
@@ -635,12 +503,28 @@ static int gb_gpio_connection_init(struct gb_connection *connection)
 	ggc = kzalloc(sizeof(*ggc), GFP_KERNEL);
 	if (!ggc)
 		return -ENOMEM;
+
+	connection =
+		gb_connection_create(gbphy_dev->bundle,
+				     le16_to_cpu(gbphy_dev->cport_desc->id),
+				     gb_gpio_request_handler);
+	if (IS_ERR(connection)) {
+		ret = PTR_ERR(connection);
+		goto exit_ggc_free;
+	}
+
 	ggc->connection = connection;
-	connection->private = ggc;
+	gb_connection_set_data(connection, ggc);
+	ggc->gbphy_dev = gbphy_dev;
+	gb_gbphy_set_data(gbphy_dev, ggc);
+
+	ret = gb_connection_enable_tx(connection);
+	if (ret)
+		goto exit_connection_destroy;
 
 	ret = gb_gpio_controller_setup(ggc);
 	if (ret)
-		goto err_free_controller;
+		goto exit_connection_disable;
 
 	irqc = &ggc->irqc;
 	irqc->irq_mask = gb_gpio_irq_mask;
@@ -655,7 +539,7 @@ static int gb_gpio_connection_init(struct gb_connection *connection)
 	gpio = &ggc->chip;
 
 	gpio->label = "greybus_gpio";
-	gpio->dev = &connection->dev;
+	gpio->parent = &gbphy_dev->dev;
 	gpio->owner = THIS_MODULE;
 
 	gpio->request = gb_gpio_request;
@@ -665,59 +549,74 @@ static int gb_gpio_connection_init(struct gb_connection *connection)
 	gpio->direction_output = gb_gpio_direction_output;
 	gpio->get = gb_gpio_get;
 	gpio->set = gb_gpio_set;
-	gpio->set_debounce = gb_gpio_set_debounce;
-	gpio->to_irq = gb_gpio_to_irq;
+	gpio->set_config = gb_gpio_set_config;
 	gpio->base = -1;		/* Allocate base dynamically */
 	gpio->ngpio = ggc->line_max + 1;
 	gpio->can_sleep = true;
 
+	ret = gb_connection_enable(connection);
+	if (ret)
+		goto exit_line_free;
+
 	ret = gpiochip_add(gpio);
 	if (ret) {
-		dev_err(&connection->dev, "failed to add gpio chip: %d\n",
-			ret);
-		goto err_free_lines;
+		dev_err(&gbphy_dev->dev, "failed to add gpio chip: %d\n", ret);
+		goto exit_line_free;
 	}
 
-	ret = gb_gpio_irqchip_add(gpio, irqc, 0,
-				   handle_level_irq, IRQ_TYPE_NONE);
+	ret = gpiochip_irqchip_add(gpio, irqc, 0, handle_level_irq,
+				   IRQ_TYPE_NONE);
 	if (ret) {
-		dev_err(&connection->dev, "failed to add irq chip: %d\n", ret);
-		goto irqchip_err;
+		dev_err(&gbphy_dev->dev, "failed to add irq chip: %d\n", ret);
+		goto exit_gpiochip_remove;
 	}
 
+	gbphy_runtime_put_autosuspend(gbphy_dev);
 	return 0;
 
-irqchip_err:
-	gb_gpiochip_remove(gpio);
-err_free_lines:
+exit_gpiochip_remove:
+	gpiochip_remove(gpio);
+exit_line_free:
 	kfree(ggc->lines);
-err_free_controller:
+exit_connection_disable:
+	gb_connection_disable(connection);
+exit_connection_destroy:
+	gb_connection_destroy(connection);
+exit_ggc_free:
 	kfree(ggc);
 	return ret;
 }
 
-static void gb_gpio_connection_exit(struct gb_connection *connection)
+static void gb_gpio_remove(struct gbphy_device *gbphy_dev)
 {
-	struct gb_gpio_controller *ggc = connection->private;
+	struct gb_gpio_controller *ggc = gb_gbphy_get_data(gbphy_dev);
+	struct gb_connection *connection = ggc->connection;
+	int ret;
 
-	if (!ggc)
-		return;
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		gbphy_runtime_get_noresume(gbphy_dev);
 
-	gb_gpio_irqchip_remove(ggc);
-	gb_gpiochip_remove(&ggc->chip);
-	/* kref_put(ggc->connection) */
+	gb_connection_disable_rx(connection);
+	gpiochip_remove(&ggc->chip);
+	gb_connection_disable(connection);
+	gb_connection_destroy(connection);
 	kfree(ggc->lines);
 	kfree(ggc);
 }
 
-static struct gb_protocol gpio_protocol = {
-	.name			= "gpio",
-	.id			= GREYBUS_PROTOCOL_GPIO,
-	.major			= GB_GPIO_VERSION_MAJOR,
-	.minor			= GB_GPIO_VERSION_MINOR,
-	.connection_init	= gb_gpio_connection_init,
-	.connection_exit	= gb_gpio_connection_exit,
-	.request_recv		= gb_gpio_request_recv,
+static const struct gbphy_device_id gb_gpio_id_table[] = {
+	{ GBPHY_PROTOCOL(GREYBUS_PROTOCOL_GPIO) },
+	{ },
+};
+MODULE_DEVICE_TABLE(gbphy, gb_gpio_id_table);
+
+static struct gbphy_driver gpio_driver = {
+	.name		= "gpio",
+	.probe		= gb_gpio_probe,
+	.remove		= gb_gpio_remove,
+	.id_table	= gb_gpio_id_table,
 };
 
-gb_builtin_protocol_driver(gpio_protocol);
+module_gbphy_driver(gpio_driver);
+MODULE_LICENSE("GPL v2");

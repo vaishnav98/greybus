@@ -1,66 +1,82 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Greybus Interface Block code
  *
  * Copyright 2014 Google Inc.
  * Copyright 2014 Linaro Ltd.
- *
- * Released under the GPLv2 only.
  */
 
 #ifndef __INTERFACE_H
 #define __INTERFACE_H
 
-/* Greybus "public" definitions" */
+enum gb_interface_type {
+	GB_INTERFACE_TYPE_INVALID = 0,
+	GB_INTERFACE_TYPE_UNKNOWN,
+	GB_INTERFACE_TYPE_DUMMY,
+	GB_INTERFACE_TYPE_UNIPRO,
+	GB_INTERFACE_TYPE_GREYBUS,
+};
+
+#define GB_INTERFACE_QUIRK_NO_CPORT_FEATURES		BIT(0)
+#define GB_INTERFACE_QUIRK_NO_INIT_STATUS		BIT(1)
+#define GB_INTERFACE_QUIRK_NO_GMP_IDS			BIT(2)
+#define GB_INTERFACE_QUIRK_FORCED_DISABLE		BIT(3)
+#define GB_INTERFACE_QUIRK_LEGACY_MODE_SWITCH		BIT(4)
+#define GB_INTERFACE_QUIRK_NO_BUNDLE_ACTIVATE		BIT(5)
+#define GB_INTERFACE_QUIRK_NO_PM			BIT(6)
+
 struct gb_interface {
 	struct device dev;
 	struct gb_control *control;
 
 	struct list_head bundles;
-	struct list_head links;	/* greybus_host_device->interfaces */
+	struct list_head module_node;
 	struct list_head manifest_descs;
 	u8 interface_id;	/* Physical location within the Endo */
-	u8 device_id;		/* Device id allocated for the interface block by the SVC */
+	u8 device_id;
+	u8 features;		/* Feature flags set in the manifest */
 
-	/* Information taken from the manifest descriptor */
-	u16 vendor;
-	u16 product;
-	char *vendor_string;
-	char *product_string;
-	u64 unique_id;
+	enum gb_interface_type type;
 
-	/* Information taken from the hotplug event */
-	u32 unipro_mfg_id;
-	u32 unipro_prod_id;
-	u32 ara_vend_id;
-	u32 ara_prod_id;
+	u32 ddbl1_manufacturer_id;
+	u32 ddbl1_product_id;
+	u32 vendor_id;
+	u32 product_id;
+	u64 serial_number;
 
+	struct gb_host_device *hd;
 	struct gb_module *module;
-	struct greybus_host_device *hd;
+
+	unsigned long quirks;
+
+	struct mutex mutex;
+
+	bool disconnected;
+
+	bool ejected;
+	bool removed;
+	bool active;
+	bool enabled;
+	bool mode_switch;
+	bool dme_read;
+
+	struct work_struct mode_switch_work;
+	struct completion mode_switch_completion;
 };
 #define to_gb_interface(d) container_of(d, struct gb_interface, dev)
 
-static inline void gb_interface_set_drvdata(struct gb_interface *intf,
-					    void *data)
-{
-	dev_set_drvdata(&intf->dev, data);
-}
-
-static inline void *gb_interface_get_drvdata(struct gb_interface *intf)
-{
-	return dev_get_drvdata(&intf->dev);
-}
-
-/* Greybus "private" definitions */
-
-struct gb_interface *gb_interface_find(struct greybus_host_device *hd,
-				       u8 interface_id);
-
-struct gb_interface *gb_interface_create(struct greybus_host_device *hd,
+struct gb_interface *gb_interface_create(struct gb_module *module,
 					 u8 interface_id);
-void gb_interface_destroy(struct gb_interface *intf);
-int gb_interface_init(struct gb_interface *intf, u8 device_id);
-void gb_interface_remove(struct gb_interface *intf);
-void gb_interfaces_remove(struct greybus_host_device *hd);
+int gb_interface_activate(struct gb_interface *intf);
+void gb_interface_deactivate(struct gb_interface *intf);
+int gb_interface_enable(struct gb_interface *intf);
+void gb_interface_disable(struct gb_interface *intf);
+int gb_interface_add(struct gb_interface *intf);
+void gb_interface_del(struct gb_interface *intf);
+void gb_interface_put(struct gb_interface *intf);
+void gb_interface_mailbox_event(struct gb_interface *intf, u16 result,
+								u32 mailbox);
 
-int gb_create_bundle_connection(struct gb_interface *intf, u8 class);
+int gb_interface_request_mode_switch(struct gb_interface *intf);
+
 #endif /* __INTERFACE_H */

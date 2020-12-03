@@ -1,26 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * Greybus module code
+ * Greybus Module code
  *
- * Copyright 2014 Google Inc.
- *
- * Released under the GPLv2 only.
+ * Copyright 2016 Google Inc.
+ * Copyright 2016 Linaro Ltd.
  */
 
 #ifndef __MODULE_H
 #define __MODULE_H
 
-/* Greybus "public" definitions" */
 struct gb_module {
 	struct device dev;
-	u8 module_id;		/* Physical location within the Endo */
+	struct gb_host_device *hd;
+
+	struct list_head hd_node;
+
+	u8 module_id;
+	size_t num_interfaces;
+
+	bool disconnected;
+
+	struct gb_interface *interfaces[0];
 };
 #define to_gb_module(d) container_of(d, struct gb_module, dev)
 
-struct greybus_host_device;
-
-/* Greybus "private" definitions */
-struct gb_module *gb_module_find(struct greybus_host_device *hd, u8 module_id);
-struct gb_module *gb_module_create(struct device *parent, u8 module_id);
-void gb_module_remove_all(struct gb_endo *endo);
+struct gb_module *gb_module_create(struct gb_host_device *hd, u8 module_id,
+				   size_t num_interfaces);
+int gb_module_add(struct gb_module *module);
+void gb_module_del(struct gb_module *module);
+void gb_module_put(struct gb_module *module);
 
 #endif /* __MODULE_H */

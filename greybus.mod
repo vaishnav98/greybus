@@ -1,0 +1,2 @@
+/home/vaishnav/mygreybus/core.o /home/vaishnav/mygreybus/debugfs.o /home/vaishnav/mygreybus/hd.o /home/vaishnav/mygreybus/manifest.o /home/vaishnav/mygreybus/module.o /home/vaishnav/mygreybus/interface.o /home/vaishnav/mygreybus/bundle.o /home/vaishnav/mygreybus/connection.o /home/vaishnav/mygreybus/control.o /home/vaishnav/mygreybus/svc.o /home/vaishnav/mygreybus/svc_watchdog.o /home/vaishnav/mygreybus/operation.o
+
