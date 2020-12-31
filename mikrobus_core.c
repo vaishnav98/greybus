@@ -665,18 +665,18 @@ int mikrobus_port_register(struct mikrobus_port *port)
 								port->dev.parent);
 	if (retval)
 		dev_warn(&port->dev, "failed to create compatibility class link\n");
-	// if (!port->eeprom) {
-	// 	dev_info(&port->dev, "mikrobus port %d eeprom empty probing default eeprom\n",
-	// 										port->id);
-	// 	retval = mikrobus_port_eeprom_probe(port);
-	// }
-	// if (port->eeprom) {
-	// 	retval = mikrobus_port_scan_eeprom(port);
-	// 	if (retval) {
-	// 		dev_warn(&port->dev, "failed to register board from manifest\n");
-	// 		return 0;
-	// 	}
-	// }
+	 if (!port->eeprom) {
+	 	dev_info(&port->dev, "mikrobus port %d eeprom empty probing default eeprom\n",
+	 										port->id);
+	 	retval = mikrobus_port_eeprom_probe(port);
+	 }
+	 if (port->eeprom) {
+	 	retval = mikrobus_port_scan_eeprom(port);
+	 	if (retval) {
+	 		dev_warn(&port->dev, "failed to register board from manifest\n");
+	 		return 0;
+	 	}
+	 }
 	return retval;
 }
 EXPORT_SYMBOL_GPL(mikrobus_port_register);
