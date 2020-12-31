@@ -17,20 +17,6 @@
 #include "greybus.h"
 #include "gbphy.h"
 
-struct gb_gpio_line {
-	/* The following has to be an array of line_max entries */
-	/* --> make them just a flags field */
-	u8			active:    1,
-				direction: 1,	/* 0 = output, 1 = input */
-				value:     1;	/* 0 = low, 1 = high */
-	u16			debounce_usec;
-
-	u8			irq_type;
-	bool			irq_type_pending;
-	bool			masked;
-	bool			masked_pending;
-};
-
 #define gpio_chip_to_gb_gpio_controller(chip) \
 	container_of(chip, struct gb_gpio_controller, chip)
 #define irq_data_to_gpio_chip(d) (d->domain->host_data)

@@ -22,6 +22,7 @@
 #include <linux/greybus.h>
 #include <linux/gpio.h>
 #include <linux/gpio/machine.h>
+#include <linux/gpio/driver.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/nvmem-provider.h>
 #include <linux/interrupt.h>
@@ -37,7 +38,7 @@
 #include <linux/regulator/machine.h>
 #include <linux/clk-provider.h>
 
-#include "../greybus/gbphy.h"
+#include "gbphy.h"
 #include "greybus_manifest.h"
 #include "mikrobus_core.h"
 #include "mikrobus_manifest.h"
@@ -378,6 +379,20 @@ static void mikrobus_board_device_release_all(struct addon_board_info *info)
 	}
 }
 
+static void mikrobus_spi_device_delete(struct spi_master* master, unsigned int cs)
+{
+    struct device* dev;
+    char str[32];
+
+    snprintf(str, sizeof(str), "%s.%u", dev_name(&master->dev), cs);
+
+    dev = bus_find_device_by_name(&spi_bus_type, NULL, str);
+    if (dev != NULL) {
+        spi_unregister_device(to_spi_device(dev));
+        put_device(dev);
+    }
+}
+
 static int mikrobus_device_register(struct mikrobus_port *port,
 					struct board_device_info *dev, char *board_name)
 {
@@ -442,6 +457,7 @@ static int mikrobus_device_register(struct mikrobus_port *port,
 	}
 	switch (dev->protocol) {
 	case GREYBUS_PROTOCOL_SPI:
+		 mikrobus_spi_device_delete(port->spi_mstr, port->chip_select[dev->reg]);
 		spi = spi_alloc_device(port->spi_mstr);
 		if (!spi)
 			return -ENOMEM;
@@ -649,18 +665,18 @@ int mikrobus_port_register(struct mikrobus_port *port)
 								port->dev.parent);
 	if (retval)
 		dev_warn(&port->dev, "failed to create compatibility class link\n");
-	if (!port->eeprom) {
-		dev_info(&port->dev, "mikrobus port %d eeprom empty probing default eeprom\n",
-											port->id);
-		retval = mikrobus_port_eeprom_probe(port);
-	}
-	if (port->eeprom) {
-		retval = mikrobus_port_scan_eeprom(port);
-		if (retval) {
-			dev_warn(&port->dev, "failed to register board from manifest\n");
-			return 0;
-		}
-	}
+	// if (!port->eeprom) {
+	// 	dev_info(&port->dev, "mikrobus port %d eeprom empty probing default eeprom\n",
+	// 										port->id);
+	// 	retval = mikrobus_port_eeprom_probe(port);
+	// }
+	// if (port->eeprom) {
+	// 	retval = mikrobus_port_scan_eeprom(port);
+	// 	if (retval) {
+	// 		dev_warn(&port->dev, "failed to register board from manifest\n");
+	// 		return 0;
+	// 	}
+	// }
 	return retval;
 }
 EXPORT_SYMBOL_GPL(mikrobus_port_register);
@@ -675,7 +691,8 @@ int mikrobus_port_gb_register(struct gbphy_host *host)
 	struct gb_connection *spi_connection;
 	struct gb_gpio_controller *ggc;
 	struct mikrobus_port *port;
-	struct gpio_device *gpio_dev;
+	struct gpio_desc *desc;
+	struct gpio_descs *descs;
 	int retval;
 
 	if (bundle->num_cports == 0)
@@ -701,21 +718,21 @@ int mikrobus_port_gb_register(struct gbphy_host *host)
 			port->i2c_adap = &gb_i2c_dev->adapter;
 			
 		}
-		if(gbphy_dev->cport_desc->protocol_id == GREYBUS_PROTOCOL_SPI){
+		else if(gbphy_dev->cport_desc->protocol_id == GREYBUS_PROTOCOL_SPI){
 			spi_connection = gb_gbphy_get_data(gbphy_dev);
-			port->spi_mstr = gb_connection_get_data(spi_connection);
+			port->spi_mstr = (struct spi_master *)gb_connection_get_data(spi_connection);
 		}
-		if(gbphy_dev->cport_desc->protocol_id == GREYBUS_PROTOCOL_GPIO){
-			// ggc = gb_gbphy_get_data(gbphy_dev);
-			// gpio_dev = ggc->chip.gpiodev;
-			//TODO: change port->gpio_descs to gpio_desc array
-			kfree(port);
-			continue;
+		else if(gbphy_dev->cport_desc->protocol_id == GREYBUS_PROTOCOL_GPIO){
+			ggc = (struct gb_gpio_controller *) gb_gbphy_get_data(gbphy_dev);
+			port->gpios = kzalloc(struct_size(descs, desc, 12), GFP_KERNEL);
+			port->gpios->desc[0] = gpio_to_desc( ggc->chip.base + 7);//PWM GPIO
+			port->gpios->desc[1] = gpio_to_desc( ggc->chip.base + 20); //INT GPIO
+			port->gpios->desc[10] = gpio_to_desc( ggc->chip.base + 19); //RST GPIO
 		}
-		retval = mikrobus_port_register(port);
-		if (retval) {
-			pr_err("port : can't register port [%d]\n", retval);
-		}
+	}
+	retval = mikrobus_port_register(port);
+	if (retval) {
+		pr_err("port : can't register port [%d]\n", retval);
 	}
 
 	return 0;

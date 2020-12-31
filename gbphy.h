@@ -41,13 +41,25 @@ struct gb_spilib {
 	u32			min_speed_hz;
 	u32			max_speed_hz;
 };
+struct gb_gpio_line {
+	/* The following has to be an array of line_max entries */
+	/* --> make them just a flags field */
+	u8			active:    1,
+				direction: 1,	/* 0 = output, 1 = input */
+				value:     1;	/* 0 = low, 1 = high */
+	u16			debounce_usec;
+
+	u8			irq_type;
+	bool			irq_type_pending;
+	bool			masked;
+	bool			masked_pending;
+};
 
 struct gb_gpio_controller {
 	struct gbphy_device	*gbphy_dev;
 	struct gb_connection	*connection;
 	u8			line_max;	/* max line number */
 	struct gb_gpio_line	*lines;
-
 	struct gpio_chip	chip;
 	struct irq_chip		irqc;
 	struct mutex		irq_lock;
