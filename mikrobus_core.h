@@ -195,7 +195,7 @@ void mikrobus_board_unregister(struct mikrobus_port *port,
 int mikrobus_board_register(struct mikrobus_port *port,
 				struct addon_board_info *board);
 int mikrobus_port_register(struct mikrobus_port *port);
-int mikrobus_port_gb_register(struct gbphy_host *gbphy_host);
+int mikrobus_port_gb_register(struct gbphy_host *host, void *manifest_blob, size_t manifest_size);
 int mikrobus_port_register(struct mikrobus_port *port);
 int mikrobus_port_pinctrl_select(struct mikrobus_port *port);
 void mikrobus_port_delete(struct mikrobus_port *port);

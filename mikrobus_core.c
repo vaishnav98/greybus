@@ -665,27 +665,28 @@ int mikrobus_port_register(struct mikrobus_port *port)
 								port->dev.parent);
 	if (retval)
 		dev_warn(&port->dev, "failed to create compatibility class link\n");
-	 if (!port->eeprom) {
-	 	dev_info(&port->dev, "mikrobus port %d eeprom empty probing default eeprom\n",
-	 										port->id);
-	 	retval = mikrobus_port_eeprom_probe(port);
-	 }
-	 if (port->eeprom) {
-	 	retval = mikrobus_port_scan_eeprom(port);
-	 	if (retval) {
-	 		dev_warn(&port->dev, "failed to register board from manifest\n");
-	 		return 0;
-	 	}
-	 }
+	//  if (!port->eeprom) {
+	//  	dev_info(&port->dev, "mikrobus port %d eeprom empty probing default eeprom\n",
+	//  										port->id);
+	//  	retval = mikrobus_port_eeprom_probe(port);
+	//  }
+	//  if (port->eeprom) {
+	//  	retval = mikrobus_port_scan_eeprom(port);
+	//  	if (retval) {
+	//  		dev_warn(&port->dev, "failed to register board from manifest\n");
+	//  		return 0;
+	//  	}
+	//  }
 	return retval;
 }
 EXPORT_SYMBOL_GPL(mikrobus_port_register);
 
 
 
-int mikrobus_port_gb_register(struct gbphy_host *host)
+int mikrobus_port_gb_register(struct gbphy_host *host, void *manifest_blob, size_t manifest_size)
 {
 	struct gb_bundle *bundle = host->bundle;
+	struct addon_board_info *board;
 	struct gbphy_device *gbphy_dev, *temp;
 	struct gb_i2c_device *gb_i2c_dev;
 	struct gb_connection *spi_connection;
@@ -735,7 +736,32 @@ int mikrobus_port_gb_register(struct gbphy_host *host)
 		pr_err("port : can't register port [%d]\n", retval);
 	}
 
+	board = kzalloc(sizeof(*board), GFP_KERNEL);
+	if (!board) {
+		retval = -ENOMEM;
+		goto err_free_buf;
+	}
+	INIT_LIST_HEAD(&board->manifest_descs);
+	INIT_LIST_HEAD(&board->devices);
+	retval = mikrobus_manifest_parse(board, manifest_blob, manifest_size);
+	if (!retval) {
+		dev_err(&port->dev, "failed to parse manifest, size %lu\n",
+			manifest_size);
+		retval = -EINVAL;
+		goto err_free_board;
+	}
+	retval = mikrobus_board_register(port, board);
+	if (retval) {
+		dev_err(&port->dev, "failed to register board %s\n",
+			board->name);
+		goto err_free_board;
+	}
 	return 0;
+err_free_board:
+	kfree(board);
+err_free_buf:
+	kfree(manifest_blob);
+	return retval;
 }
 EXPORT_SYMBOL_GPL(mikrobus_port_gb_register);
 

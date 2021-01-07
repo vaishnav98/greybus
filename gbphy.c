@@ -301,7 +301,7 @@ static int gb_gbphy_probe(struct gb_bundle *bundle,
 		list_add(&gbphy_dev->list, &gbphy_host->devices);
 	}
 
-	mikrobus_port_gb_register(gbphy_host);
+	mikrobus_port_gb_register(gbphy_host, bundle->manifest_blob, bundle->manifest_size);
 
 	gb_pm_runtime_put_autosuspend(bundle);
 
